@@ -107,54 +107,46 @@ def get_invoices(
 
 @frappe.whitelist(methods=["GET"])
 def get_invoice_details(name: str):
-    """
-    Return a single 'Invoice Form' by name with minimal fields for the mobile app,
-    plus a permission object (all True for now).
-    """
     doctype = "Invoice Form"
     if not name:
         frappe.throw("Missing invoice name")
 
-    try:
-        doc = frappe.get_doc(doctype, name)
-    except frappe.DoesNotExistError:
-        frappe.throw("Invoice not found", frappe.DoesNotExistError)
-
+    doc = frappe.get_doc(doctype, name)
     if not doc.has_permission("read"):
         frappe.throw("Not permitted", frappe.PermissionError)
 
-    # Map status from docstatus / is_draft if applicable
     status_map = {0: "draft", 1: "submitted", 2: "cancelled"}
     status = status_map.get(doc.docstatus or 0, "draft")
     is_locked = bool(getattr(doc, "lock_update", False))
 
-    # Items mapping
     items = []
     for it in getattr(doc, "items", []):
         items.append({
             "id": cstr(getattr(it, "name", "")),
             "name": cstr(getattr(it, "item_name", "") or getattr(it, "item_code", "")),
-            "quantity": float(getattr(it, "qty", 0) or getattr(it, "quantity", 0) or 0),
+            "quantity": float(getattr(it, "qty", 0) or 0),
             "price": float(getattr(it, "price", 0) or 0),
             "total": float(getattr(it, "total", 0) or 0),
             "customerId": cstr(getattr(it, "customer", "")),
             "customerName": cstr(getattr(it, "customer", "")),
         })
 
-    # Response payload shaped for the Vue app
     return {
         "id": cstr(getattr(doc, "name", name)),
         "invoiceNumber": cstr(getattr(doc, "name", name)),
         "supplierId": cstr(getattr(doc, "supplier", "")),
-        "supplierName": cstr(getattr(doc, "supplier_name", "")),
+        "supplierName": cstr(getattr(doc, "supplier_name", "")),  # FIX
         "date": cstr(getattr(doc, "posting_date", "")),
         "amount": float(getattr(doc, "grand_total", 0) or 0),
         "status": status,
         "is_locked": is_locked,
         "items": items,
         "tax": float(getattr(doc, "total_commissions_and_taxes", 0) or 0),
-        "payments": [],  # extend if needed later
+        "payments": [],
         "notes": cstr(getattr(doc, "remarks", "")),
+        # ADD THESE for defaults/selects:
+        "customer": cstr(getattr(doc, "customer", "")),
+        "customer_name": cstr(getattr(doc, "customer", "")),
         "permission": {
             "can_update": True,
             "can_delete": True,
