@@ -3,7 +3,7 @@ import json
 import frappe
 from frappe.utils import cint, cstr, flt, nowtime
 
-from mobile_endpoints.api._envelope import ERR_CONFLICT, fail, mobile_api
+from mobile_endpoints.api._envelope import StaleDocumentError, mobile_api
 from mobile_endpoints.api._idempotency import lookup as _idem_lookup
 from mobile_endpoints.api._idempotency import run_idempotent
 
@@ -229,7 +229,8 @@ def create_invoice_form():
 				"customer": it.get("customer") or "",
 			})
 		doc.insert(ignore_permissions=True)
-		frappe.db.commit()
+		# NOTE: no commit here — run_idempotent() owns the transaction so the
+		# key reservation and this insert commit atomically.
 
 		response = {
 			"name": doc.name,
@@ -276,84 +277,102 @@ def update_invoice(name: str | None = None, data: dict | str | None = None, base
 		payload = json.loads(payload or "{}")
 	payload = payload or {}
 	base_modified = base_modified or body.get("base_modified")
+	client_request_id = body["client_request_id"]
 
-	doc = frappe.get_doc(DOCTYPE, name)
-	if not doc.has_permission("write"):
-		frappe.throw("Not permitted", frappe.PermissionError)
+	def _do():
+		doc = frappe.get_doc(DOCTYPE, name)
+		if not doc.has_permission("write"):
+			frappe.throw("Not permitted", frappe.PermissionError)
 
-	# Optimistic concurrency.
-	if base_modified and cstr(doc.modified) != cstr(base_modified):
-		return fail(
-			ERR_CONFLICT,
-			frappe._("This invoice was changed on the server. Reload the latest data and try again."),
-			fields={"server_modified": cstr(doc.modified)},
-			http_status=409,
-			data=_details_dict(doc),
-		)
+		# Optimistic concurrency — checked only on the fresh path; a replay of
+		# the same client_request_id returns the stored result untouched.
+		if base_modified and cstr(doc.modified) != cstr(base_modified):
+			raise StaleDocumentError(
+				frappe._("This invoice was changed on the server. Reload the latest data and try again."),
+				current=_details_dict(doc),
+			)
 
-	if payload.get("posting_date"):
-		doc.posting_date = payload.get("posting_date")
-	if payload.get("supplier"):
-		doc.supplier = payload.get("supplier")
-	if payload.get("supplier_name"):
-		doc.supplier_name = payload.get("supplier_name")
+		if payload.get("posting_date"):
+			doc.posting_date = payload.get("posting_date")
+		if payload.get("supplier"):
+			doc.supplier = payload.get("supplier")
+		if payload.get("supplier_name"):
+			doc.supplier_name = payload.get("supplier_name")
 
-	if isinstance(payload.get("items"), list):
-		doc.set("items", [])
-		grand_total = 0.0
-		for it in payload["items"]:
-			qty = flt(it.get("qty") or it.get("quantity") or 0)
-			price = flt(it.get("price") or 0)
-			line_total = flt(it.get("total")) or (qty * price)
-			grand_total += line_total
-			row = doc.append("items", {})
-			row.item_code = it.get("item_code") or it.get("item_name") or None
-			row.item_name = it.get("item_name") or it.get("item_code") or None
-			row.qty = qty
-			row.price = price
-			row.total = line_total
-			row.customer = it.get("customer") or it.get("customerId") or ""
-		doc.grand_total = grand_total
-		commission_rate = flt(payload.get("commission_rate") or 5)
-		tax_rate = flt(payload.get("tax_rate") or 15)
-		total_commission = (grand_total * commission_rate) / 100.0
-		doc.total_commissions_and_taxes = total_commission + (total_commission * tax_rate) / 100.0
+		if isinstance(payload.get("items"), list):
+			doc.set("items", [])
+			grand_total = 0.0
+			for it in payload["items"]:
+				qty = flt(it.get("qty") or it.get("quantity") or 0)
+				price = flt(it.get("price") or 0)
+				line_total = flt(it.get("total")) or (qty * price)
+				grand_total += line_total
+				row = doc.append("items", {})
+				row.item_code = it.get("item_code") or it.get("item_name") or None
+				row.item_name = it.get("item_name") or it.get("item_code") or None
+				row.qty = qty
+				row.price = price
+				row.total = line_total
+				row.customer = it.get("customer") or it.get("customerId") or ""
+			doc.grand_total = grand_total
+			commission_rate = flt(payload.get("commission_rate") or 5)
+			tax_rate = flt(payload.get("tax_rate") or 15)
+			total_commission = (grand_total * commission_rate) / 100.0
+			doc.total_commissions_and_taxes = total_commission + (total_commission * tax_rate) / 100.0
 
-	doc.save(ignore_permissions=False)
-	frappe.db.commit()
-	return {
-		"name": cstr(doc.name),
-		"modified": cstr(doc.modified),
-		"grand_total": doc.get("grand_total"),
-		"total_commissions_and_taxes": doc.get("total_commissions_and_taxes"),
-	}
+		doc.save(ignore_permissions=False)  # no commit — run_idempotent owns it
+		return doc.name, {
+			"name": cstr(doc.name),
+			"modified": cstr(doc.modified),
+			"grand_total": doc.get("grand_total"),
+			"total_commissions_and_taxes": doc.get("total_commissions_and_taxes"),
+		}
+
+	return run_idempotent(client_request_id, "invoice.update", {"name": name, "data": payload}, _do)
 
 
 @frappe.whitelist(methods=["POST"])
 @mobile_api
 def submit_invoice(name: str | None = None):
-	name = name or _read_body()["name"]
+	body = _read_body()
+	name = name or body["name"]
 	if not name:
 		frappe.throw("Missing invoice name")
-	doc = frappe.get_doc(DOCTYPE, name)
-	if not doc.has_permission("submit"):
-		frappe.throw("Not permitted", frappe.PermissionError)
-	if doc.docstatus != 0:
-		frappe.throw("Only draft invoices can be submitted")
-	doc.submit()
-	frappe.db.commit()
-	return {"name": cstr(doc.name), "docstatus": doc.docstatus, "modified": cstr(doc.modified)}
+	client_request_id = body["client_request_id"]
+
+	def _do():
+		doc = frappe.get_doc(DOCTYPE, name)
+		if not doc.has_permission("submit"):
+			frappe.throw("Not permitted", frappe.PermissionError)
+		if doc.docstatus != 0:
+			frappe.throw("Only draft invoices can be submitted")
+		doc.submit()  # no commit
+		return doc.name, {
+			"name": cstr(doc.name),
+			"docstatus": doc.docstatus,
+			"modified": cstr(doc.modified),
+		}
+
+	return run_idempotent(client_request_id, "invoice.submit", {"name": name}, _do)
 
 
 @frappe.whitelist(methods=["POST"])
 @mobile_api
 def delete_invoice(name: str | None = None):
-	name = name or _read_body()["name"]
+	body = _read_body()
+	name = name or body["name"]
 	if not name:
 		frappe.throw("Missing invoice name")
-	doc = frappe.get_doc(DOCTYPE, name)
-	if not doc.has_permission("delete"):
-		frappe.throw("Not permitted", frappe.PermissionError)
-	frappe.delete_doc(DOCTYPE, name, ignore_permissions=False)
-	frappe.db.commit()
-	return {"deleted": True, "name": cstr(name)}
+	client_request_id = body["client_request_id"]
+
+	def _do():
+		doc = frappe.get_doc(DOCTYPE, name)
+		if not doc.has_permission("delete"):
+			frappe.throw("Not permitted", frappe.PermissionError)
+		frappe.delete_doc(DOCTYPE, name, ignore_permissions=False)  # no commit
+		return name, {"deleted": True, "name": cstr(name)}
+
+	# A replay of this exact client_request_id returns {"deleted": true} even
+	# though the doc is gone; a fresh id against an already-deleted doc still
+	# raises DoesNotExistError -> 404 (never a false "success").
+	return run_idempotent(client_request_id, "invoice.delete", {"name": name}, _do)

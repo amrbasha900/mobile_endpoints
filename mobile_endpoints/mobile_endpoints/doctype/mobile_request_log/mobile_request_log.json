@@ -1,12 +1,13 @@
 {
  "actions": [],
  "allow_rename": 0,
- "autoname": "field:client_request_id",
+ "autoname": "field:composite_key",
  "creation": "2026-09-09 00:00:00",
  "doctype": "DocType",
  "editable_grid": 1,
  "engine": "InnoDB",
  "field_order": [
+  "composite_key",
   "client_request_id",
   "scope",
   "status",
@@ -17,12 +18,21 @@
  ],
  "fields": [
   {
+   "fieldname": "composite_key",
+   "fieldtype": "Data",
+   "label": "Composite Key",
+   "length": 64,
+   "read_only": 1,
+   "reqd": 1,
+   "unique": 1
+  },
+  {
    "fieldname": "client_request_id",
    "fieldtype": "Data",
    "in_list_view": 1,
    "label": "Client Request Id",
    "reqd": 1,
-   "unique": 1
+   "search_index": 1
   },
   {
    "fieldname": "scope",
@@ -42,7 +52,8 @@
    "fieldname": "user",
    "fieldtype": "Link",
    "label": "User",
-   "options": "User"
+   "options": "User",
+   "search_index": 1
   },
   {
    "fieldname": "docname",

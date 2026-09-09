@@ -28,6 +28,23 @@ ERR_RATE_LIMITED = "rate_limited"
 ERR_SERVER = "server_error"
 
 
+class StaleDocumentError(frappe.ValidationError):
+    """Raised when an update's `base_modified` no longer matches the server.
+    Carry the current server state on `.current` so the client can reload."""
+
+    def __init__(self, message, current=None):
+        super().__init__(message)
+        self.current = current
+
+
+class CompanyError(frappe.ValidationError):
+    """Company could not be resolved / is not permitted for this user."""
+
+    def __init__(self, message, field="company"):
+        super().__init__(message)
+        self.field = field
+
+
 def request_id() -> str:
     rid = getattr(frappe.local, "mobile_request_id", None)
     if not rid:
@@ -83,9 +100,10 @@ def _first_message(exc: Exception) -> str:
 def mobile_api(fn):
     """Wrap a whitelisted handler so every outcome is a unified envelope.
 
-    - a handler may `return _envelope.fail(...)` directly for expected errors
-      (validation / 409) — it is passed through untouched;
+    - a handler may `return _envelope.fail(...)` directly — passed through;
     - a plain dict return is wrapped with `ok(...)`;
+    - `StaleDocumentError`  -> 409 `conflict` (with current state in `data`);
+    - `CompanyError`        -> 422 `validation_error` (with `fields`);
     - `frappe.PermissionError` -> 403 `permission_denied`;
     - `frappe.DoesNotExistError` -> 404 `not_found`;
     - `IdempotencyConflict` -> 409 `idempotency_conflict`;
@@ -95,11 +113,27 @@ def mobile_api(fn):
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        # Local import to avoid a circular import at module load.
         from mobile_endpoints.api._idempotency import IdempotencyConflict
 
         try:
             result = fn(*args, **kwargs)
+        except StaleDocumentError as exc:
+            frappe.db.rollback()
+            return fail(
+                ERR_CONFLICT,
+                str(exc) or _("This record was changed on the server. Reload and try again."),
+                fields={"server_modified": ""},
+                http_status=409,
+                data=getattr(exc, "current", None),
+            )
+        except CompanyError as exc:
+            frappe.db.rollback()
+            return fail(
+                ERR_VALIDATION,
+                str(exc) or _("A company is required."),
+                fields={getattr(exc, "field", "company"): "invalid"},
+                http_status=422,
+            )
         except frappe.PermissionError as exc:
             frappe.db.rollback()
             return fail(ERR_PERMISSION_DENIED, str(exc) or _("Not permitted"), http_status=403)

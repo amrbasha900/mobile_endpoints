@@ -7,10 +7,11 @@ from frappe.utils import cint, cstr
 from mobile_endpoints.api._envelope import mobile_api
 from mobile_endpoints.api._idempotency import lookup as _idem_lookup
 from mobile_endpoints.api._idempotency import run_idempotent
+from mobile_endpoints.api.user import resolve_company
 
 # --- helpers ---------------------------------------------------------------
 
-MANDATORY_PARENT_FIELDS = {"posting_date", "company"}
+MANDATORY_PARENT_FIELDS = {"posting_date"}
 MANDATORY_DETAIL_FIELDS = {"payment_type", "party_type", "party", "party_name", "amount"}
 
 
@@ -45,15 +46,19 @@ def create_collection_payment():
 	client_request_id = data.get("client_request_id")
 
 	_ensure_fields(MANDATORY_PARENT_FIELDS, data, _("Parent Validation Error"))
+	# Explicit company (permission-checked) -> user/global default -> the single
+	# permitted company; otherwise CompanyError -> 422 with fields.company.
+	company = resolve_company(data.get("company"))
+
 	detail = data.get("detail") or (data.get("collection_and_payment_details") or [{}])[0]
 	if not detail:
 		frappe.throw(_("At least one payment detail is required"), title=_("Child Validation Error"))
 	_ensure_fields(MANDATORY_DETAIL_FIELDS, detail, _("Child Validation Error"))
 
-	# Idempotency scope key excludes the request id itself.
+	# Idempotency hash covers the resolved company, not the raw request id.
 	idem_payload = {
 		"posting_date": data.get("posting_date"),
-		"company": data.get("company"),
+		"company": company,
 		"detail": {k: detail.get(k) for k in sorted(MANDATORY_DETAIL_FIELDS | {"mode_of_payment", "description"})},
 	}
 
@@ -61,7 +66,7 @@ def create_collection_payment():
 		doc = frappe.new_doc("Collection and Payment")
 		doc.update({
 			"posting_date": data["posting_date"],
-			"company": data["company"],
+			"company": company,
 			"pamper_collection_and_payment": 1,
 			"pamper_collection": 1 if doc.meta.has_field("pamper_collection") else None,
 		})
@@ -75,11 +80,11 @@ def create_collection_payment():
 			"description": detail.get("description"),
 			"is_pamper": 1,
 		})
-		doc.insert(ignore_permissions=False)
-		frappe.db.commit()
+		doc.insert(ignore_permissions=False)  # no commit — run_idempotent owns it
 		return doc.name, {
 			"name": doc.name,
 			"posting_date": cstr(doc.posting_date),
+			"company": company,
 			"modified": cstr(doc.modified),
 			"message": _("Collection payment created"),
 		}
