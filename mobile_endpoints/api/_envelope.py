@@ -134,6 +134,9 @@ def mobile_api(fn):
                 fields={getattr(exc, "field", "company"): "invalid"},
                 http_status=422,
             )
+        except frappe.AuthenticationError as exc:
+            frappe.db.rollback()
+            return fail(ERR_NOT_AUTHENTICATED, str(exc) or _("Authentication required"), http_status=401)
         except frappe.PermissionError as exc:
             frappe.db.rollback()
             return fail(ERR_PERMISSION_DENIED, str(exc) or _("Not permitted"), http_status=403)
