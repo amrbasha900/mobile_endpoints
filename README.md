@@ -21,16 +21,18 @@ Android and iOS requests do not require CORS.
 {
   "allow_cors": ["https://app.example.com"],
   "pamper_oauth_client_id": "<oauth-client-id>",
-  "pamper_allow_legacy_api_key_login": true,
+  "pamper_allow_legacy_api_key_login": false,
   "pamper_commission_rate": 5,
   "pamper_tax_rate": 15
 }
 ```
 
 Create an OAuth Client in Frappe with the exact Web, Android, and iOS callback
-URIs used by the Pamper app. After the client completes its OAuth2 Authorization
-Code + PKCE migration, set `pamper_allow_legacy_api_key_login` to `false` and
-restart the site processes. Do not use `allow_cors: "*"` in production.
+URIs used by the Pamper app. Legacy password-to-API-key login is disabled by
+default. It may be enabled temporarily for the current client with an explicit
+site setting, then must be disabled after the OAuth2 Authorization Code + PKCE
+migration. Do not use `allow_cors: "*"` in production; the API accepts only
+exact origins from the allowlist.
 
 ### Contributing
 

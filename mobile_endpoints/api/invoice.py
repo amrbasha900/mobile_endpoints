@@ -49,19 +49,23 @@ def _parse_payload(data: dict | str | None = None) -> dict:
 			payload = json.loads(frappe.request.data)
 		except (TypeError, ValueError):
 			frappe.throw(_("Unable to parse JSON body"), frappe.ValidationError)
-	return payload if isinstance(payload, dict) else {}
+	if not isinstance(payload, dict):
+		frappe.throw(_("JSON body must be an object"), frappe.ValidationError)
+	return payload
 
 
 def _invoice_rates() -> tuple[float, float]:
 	"""Read financial rates from site config; clients cannot override them."""
 	commission_rate = flt(frappe.conf.get("pamper_commission_rate", 5))
 	tax_rate = flt(frappe.conf.get("pamper_tax_rate", 15))
-	if commission_rate < 0 or tax_rate < 0:
-		frappe.throw(_("Pamper commission and tax rates must not be negative"))
+	if not 0 <= commission_rate <= 100 or not 0 <= tax_rate <= 100:
+		frappe.throw(_("Pamper commission and tax rates must be between 0 and 100"))
 	return commission_rate, tax_rate
 
 
 def _normalized_item(item: dict) -> dict:
+	if not isinstance(item, dict):
+		frappe.throw(_("Every invoice row must be an object"), frappe.ValidationError)
 	item_code = cstr(item.get("item_code") or item.get("item_name")).strip()
 	customer = cstr(item.get("customer") or item.get("customerId")).strip()
 	qty = flt(item.get("qty") if item.get("qty") is not None else item.get("quantity"))
@@ -95,7 +99,7 @@ def _get_party_display(doctype: str, party: str, party_name: str | None) -> str:
 	return _display_name(party, fetched_name)
 
 
-@frappe.whitelist(methods=["GET"])
+@frappe.whitelist(allow_guest=True, methods=["GET"])
 def get_invoice_references(limit: int | str = 200):
 	set_cors_headers("GET, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
@@ -107,18 +111,21 @@ def get_invoice_references(limit: int | str = 200):
 
 	suppliers = frappe.get_list(
 		"Supplier",
+		filters={"disabled": 0},
 		fields=["name", "supplier_name"],
 		order_by="modified desc",
 		limit_page_length=limit,
 	)
 	customers = frappe.get_list(
 		"Customer",
+		filters={"disabled": 0},
 		fields=["name", "customer_name"],
 		order_by="modified desc",
 		limit_page_length=limit,
 	)
 	items = frappe.get_list(
 		"Item",
+		filters={"disabled": 0},
 		fields=["name", "item_name"],
 		order_by="modified desc",
 		limit_page_length=limit,
@@ -152,7 +159,7 @@ def get_invoice_references(limit: int | str = 200):
 	}
 
 
-@frappe.whitelist(methods=["GET"])
+@frappe.whitelist(allow_guest=True, methods=["GET"])
 def get_invoices(
 	start_date: str | None = None,
 	end_date: str | None = None,
@@ -202,6 +209,8 @@ def get_invoices(
 	if supplier:
 		filters.append(["supplier", "=", cstr(supplier)])
 
+	meta = frappe.get_meta(doctype)
+
 	# Status filter
 	if status:
 		normalized = cstr(status).strip().lower()
@@ -210,11 +219,14 @@ def get_invoices(
 			filters.append(["docstatus", "=", status_map[normalized]])
 		elif normalized == "pending":
 			# Try to match workflow/status fields when available
-			meta = frappe.get_meta(doctype)
 			if meta.has_field("status"):
 				filters.append(["status", "=", "Pending"])
 			elif meta.has_field("workflow_state"):
 				filters.append(["workflow_state", "=", "Pending"])
+			else:
+				filters.append(["docstatus", "=", 0])
+		else:
+			frappe.throw(_("Unsupported invoice status"), frappe.ValidationError)
 
 	# Minimal fields required by the Vue list page
 	fields = [
@@ -224,9 +236,11 @@ def get_invoices(
 		"supplier_name",  # supplierName
 		"grand_total",  # amount
 		"docstatus",  # status
-		"status",
-		"workflow_state",
 	]
+	if meta.has_field("status"):
+		fields.append("status")
+	if meta.has_field("workflow_state"):
+		fields.append("workflow_state")
 
 	order_by = "posting_date desc, creation desc"
 
@@ -240,7 +254,6 @@ def get_invoices(
 				["supplier_name", "like", f"%{s}%"],
 				["supplier", "like", f"%{s}%"],
 			]
-			meta = frappe.get_meta(doctype)
 			if meta.has_field("customer"):
 				or_filters.append(["customer", "like", f"%{s}%"])
 			if meta.has_field("customer_name"):
@@ -312,17 +325,16 @@ def get_invoices(
 	}
 
 
-@frappe.whitelist(methods=["GET"])
-def get_invoice_details(name: str):
+@frappe.whitelist(allow_guest=True, methods=["GET"])
+def get_invoice_details(name: str | None = None):
 	doctype = "Invoice Form"
-	if not name:
-		frappe.throw("Missing invoice name")
-
 	set_cors_headers("GET, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
 		return {}
 
 	require_authenticated_user()
+	if not name:
+		frappe.throw(_("Missing invoice name"), frappe.ValidationError)
 
 	doc = frappe.get_doc(doctype, name)
 	if not doc.has_permission("read"):
@@ -401,8 +413,8 @@ def get_invoice_details(name: str):
 	}
 
 
-@frappe.whitelist(methods=["POST"])
-def update_invoice(name: str, data: dict | None = None):
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def update_invoice(name: str | None = None, data: dict | None = None):
 	"""
 	Update minimal fields for 'Invoice Form'.
 	Expects JSON body or dict with fields like:
@@ -420,6 +432,8 @@ def update_invoice(name: str, data: dict | None = None):
 	doc = frappe.get_doc(doctype, name)
 	if not doc.has_permission("write"):
 		frappe.throw("Not permitted", frappe.PermissionError)
+	if int(doc.docstatus or 0) != 0:
+		frappe.throw(_("Only draft invoices can be updated"), frappe.ValidationError)
 
 	payload = _parse_payload(data)
 	# Map safe fields
@@ -455,7 +469,6 @@ def update_invoice(name: str, data: dict | None = None):
 		doc.grand_total = grand_total
 		doc.total_commissions_and_taxes = total_commission + (total_commission * tax_rate / 100.0)
 	doc.save(ignore_permissions=False)
-	frappe.db.commit()
 	return {
 		"name": cstr(doc.name),
 		"grand_total": float(doc.get("grand_total") or 0),
@@ -463,8 +476,8 @@ def update_invoice(name: str, data: dict | None = None):
 	}
 
 
-@frappe.whitelist(methods=["POST"])
-def submit_invoice(name: str):
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def submit_invoice(name: str | None = None):
 	"""
 	Submit the invoice (docstatus = 1).
 	"""
@@ -484,12 +497,11 @@ def submit_invoice(name: str):
 		frappe.throw("Only draft invoices can be submitted")
 
 	doc.submit()
-	frappe.db.commit()
 	return {"name": cstr(doc.name), "docstatus": doc.docstatus}
 
 
-@frappe.whitelist(methods=["POST"])
-def delete_invoice(name: str):
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def delete_invoice(name: str | None = None):
 	"""
 	Delete the invoice document.
 	"""
@@ -506,12 +518,11 @@ def delete_invoice(name: str):
 	if not doc.has_permission("delete"):
 		frappe.throw("Not permitted", frappe.PermissionError)
 	frappe.delete_doc(doctype, name, ignore_permissions=False)
-	frappe.db.commit()
 	return {"deleted": True}
 
 
-@frappe.whitelist(methods=["POST"])
-def print_invoice(name: str, print_format: str | None = None):
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def print_invoice(name: str | None = None, print_format: str | None = None):
 	set_cors_headers("POST, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
 		return {}
@@ -541,7 +552,7 @@ def print_invoice(name: str, print_format: str | None = None):
 	}
 
 
-@frappe.whitelist(methods=["POST"])
+@frappe.whitelist(allow_guest=True, methods=["POST"])
 def create_invoice_form():
 	"""
 	Payload:
@@ -551,11 +562,9 @@ def create_invoice_form():
 	  "supplier_name": "مزرعة ...",
 	  "items": [
 	    {"item_code": "اسود", "item_name": "اسود", "qty": 5324, "price": 4534, "total": 24139016, "customer": "ابوسعيد ..."}
-	  ],
-	  "pamper_commission": 0,         # optional
-	  "commission_rate": 5,           # optional, default 5
-	  "tax_rate": 15                  # optional, default 15
+	  ]
 	}
+	Totals, commission, and tax are calculated by the server.
 	"""
 	set_cors_headers("POST, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
@@ -568,20 +577,20 @@ def create_invoice_form():
 
 	# Required
 	posting_date = data.get("posting_date")
-	supplier = data.get("supplier")
+	supplier = cstr(data.get("supplier")).strip()
 	if not posting_date or not supplier:
 		frappe.throw("Missing required fields: posting_date, supplier")
 
 	# Optional/defaults
 	_require_link_access("Supplier", supplier)
 	supplier_name = frappe.db.get_value("Supplier", supplier, "supplier_name") or supplier
-	customer = data.get("customer") or ""
+	customer = cstr(data.get("customer")).strip()
 	if customer:
 		_require_link_access("Customer", customer)
 	customer_name = frappe.db.get_value("Customer", customer, "customer_name") or customer if customer else ""
 	items = data.get("items") or []
 	commission_rate, tax_rate = _invoice_rates()
-	pamper_commission = flt(data.get("pamper_commission") or 0)
+	pamper_commission = 0.0
 
 	if not items:
 		frappe.throw("At least one item is required")

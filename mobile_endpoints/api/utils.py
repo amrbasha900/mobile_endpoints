@@ -1,10 +1,22 @@
 import frappe
 from frappe.utils import cint, cstr
 
-from mobile_endpoints.api.security import require_authenticated_user
+from mobile_endpoints.api.security import (
+	require_authenticated_user,
+	require_doctype_permission,
+	set_cors_headers,
+)
 
 
-@frappe.whitelist(methods=["GET"])
+def _prepare_get_request() -> bool:
+	set_cors_headers("GET, OPTIONS")
+	if frappe.local.request and frappe.local.request.method == "OPTIONS":
+		return False
+	require_authenticated_user()
+	return True
+
+
+@frappe.whitelist(allow_guest=True, methods=["GET"])
 def get_supplier(page: int | str = 1, page_size: int | str = 100, search: str | None = None):
 	"""
 	Returns farmer suppliers for the mobile dropdown.
@@ -14,9 +26,9 @@ def get_supplier(page: int | str = 1, page_size: int | str = 100, search: str | 
 	- Pagination using page_size + 1 to compute has_more
 	"""
 	doctype = "Supplier"
-	require_authenticated_user()
-	if not frappe.has_permission(doctype=doctype, ptype="read"):
-		frappe.throw("Not permitted", frappe.PermissionError)
+	if not _prepare_get_request():
+		return {}
+	require_doctype_permission(doctype, "read")
 
 	page = max(1, cint(page))
 	page_size = max(1, min(200, cint(page_size)))
@@ -26,11 +38,13 @@ def get_supplier(page: int | str = 1, page_size: int | str = 100, search: str | 
 
 	or_filters = None
 	if search:
-		s = f"%{cstr(search).strip()}%"
-		or_filters = [
-			["Supplier", "supplier_name", "like", s],
-			["Supplier", "name", "like", s],
-		]
+		value = cstr(search).strip()
+		if value:
+			s = f"%{value}%"
+			or_filters = [
+				["Supplier", "supplier_name", "like", s],
+				["Supplier", "name", "like", s],
+			]
 
 	fields = ["name as id", "supplier_name as name"]
 
@@ -65,12 +79,12 @@ def get_supplier(page: int | str = 1, page_size: int | str = 100, search: str | 
 	}
 
 
-@frappe.whitelist(methods=["GET"])
+@frappe.whitelist(allow_guest=True, methods=["GET"])
 def get_customer(page: int | str = 1, page_size: int | str = 20, search: str | None = None):
 	doctype = "Customer"
-	require_authenticated_user()
-	if not frappe.has_permission(doctype=doctype, ptype="read"):
-		frappe.throw("Not permitted", frappe.PermissionError)
+	if not _prepare_get_request():
+		return {}
+	require_doctype_permission(doctype, "read")
 
 	page = max(1, cint(page))
 	page_size = max(1, min(200, cint(page_size)))
@@ -79,8 +93,10 @@ def get_customer(page: int | str = 1, page_size: int | str = 20, search: str | N
 	base_filters = []
 	or_filters = None
 	if search:
-		s = f"%{cstr(search).strip()}%"
-		or_filters = [["Customer", "customer_name", "like", s], ["Customer", "name", "like", s]]
+		value = cstr(search).strip()
+		if value:
+			s = f"%{value}%"
+			or_filters = [["Customer", "customer_name", "like", s], ["Customer", "name", "like", s]]
 
 	fields = ["name as id", "customer_name as name"]
 	rows = frappe.get_list(
@@ -103,12 +119,12 @@ def get_customer(page: int | str = 1, page_size: int | str = 20, search: str | N
 	return {"customers": customers, "page": page, "page_size": page_size, "has_more": has_more}
 
 
-@frappe.whitelist(methods=["GET"])
+@frappe.whitelist(allow_guest=True, methods=["GET"])
 def get_items(page: int | str = 1, page_size: int | str = 20, search: str | None = None):
 	doctype = "Item"
-	require_authenticated_user()
-	if not frappe.has_permission(doctype=doctype, ptype="read"):
-		frappe.throw("Not permitted", frappe.PermissionError)
+	if not _prepare_get_request():
+		return {}
+	require_doctype_permission(doctype, "read")
 
 	page = max(1, cint(page))
 	page_size = max(1, min(200, cint(page_size)))
@@ -117,12 +133,14 @@ def get_items(page: int | str = 1, page_size: int | str = 20, search: str | None
 	base_filters = [["disabled", "=", 0]]
 	or_filters = None
 	if search:
-		s = f"%{cstr(search).strip()}%"
-		or_filters = [
-			["Item", "item_name", "like", s],
-			["Item", "name", "like", s],
-			["Item", "item_code", "like", s],
-		]
+		value = cstr(search).strip()
+		if value:
+			s = f"%{value}%"
+			or_filters = [
+				["Item", "item_name", "like", s],
+				["Item", "name", "like", s],
+				["Item", "item_code", "like", s],
+			]
 
 	fields = ["name as id", "item_name as name"]
 	rows = frappe.get_list(

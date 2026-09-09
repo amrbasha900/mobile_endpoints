@@ -13,7 +13,13 @@ from mobile_endpoints.api.security import (
 # --- helpers ---------------------------------------------------------------
 
 MANDATORY_PARENT_FIELDS = {"posting_date", "company"}
-MANDATORY_DETAIL_FIELDS = {"payment_type", "party_type", "party", "party_name", "amount"}
+MANDATORY_DETAIL_FIELDS = {"payment_type", "party_type", "party", "amount"}
+PARTY_NAME_FIELDS = {
+	"Customer": "customer_name",
+	"Supplier": "supplier_name",
+	"Employee": "employee_name",
+	"Shareholder": "title",
+}
 
 
 def _display_name(code: str | None, name: str | None) -> str:
@@ -40,7 +46,7 @@ def _get_default_company() -> str:
 
 
 def _ensure_fields(required: set[str], data: dict[str, Any], title: str) -> None:
-	missing = [field for field in required if not data.get(field)]
+	missing = sorted(field for field in required if not data.get(field))
 	if missing:
 		frappe.throw(
 			_("Missing required fields: {0}").format(", ".join(missing)),
@@ -51,16 +57,32 @@ def _ensure_fields(required: set[str], data: dict[str, Any], title: str) -> None
 def _extract_payload() -> dict[str, Any]:
 	if frappe.request and frappe.request.method == "POST":
 		try:
-			return frappe.parse_json(frappe.request.get_data(as_text=True) or "{}")
-		except Exception:
+			payload = frappe.parse_json(frappe.request.get_data(as_text=True) or "{}")
+		except (TypeError, ValueError):
 			frappe.throw(_("Unable to parse JSON body"), title=_("Invalid Request"))
-	return frappe.form_dict or {}
+	else:
+		payload = frappe.form_dict or {}
+	if not isinstance(payload, dict):
+		frappe.throw(_("JSON body must be an object"), frappe.ValidationError)
+	return payload
+
+
+def _payment_detail(data: dict[str, Any]) -> dict[str, Any]:
+	detail = data.get("detail")
+	if detail is None:
+		details = data.get("collection_and_payment_details") or []
+		if not isinstance(details, list):
+			frappe.throw(_("Payment details must be a list"), frappe.ValidationError)
+		detail = details[0] if details else None
+	if not isinstance(detail, dict):
+		frappe.throw(_("At least one payment detail is required"), frappe.ValidationError)
+	return detail
 
 
 # --- API: create -----------------------------------------------------------
 
 
-@frappe.whitelist(methods=["POST"])
+@frappe.whitelist(allow_guest=True, methods=["POST"])
 def create_collection_payment():
 	"""
 	POST /api/method/mobile_endpoints.api.payment.create_collection_payment
@@ -92,72 +114,73 @@ def create_collection_payment():
 		data["company"] = _get_default_company()
 	_ensure_fields(MANDATORY_PARENT_FIELDS, data, _("Parent Validation Error"))
 
-	detail = data.get("detail") or (data.get("collection_and_payment_details") or [{}])[0]
-	if not detail:
-		frappe.throw(_("At least one payment detail is required"), title=_("Child Validation Error"))
+	detail = _payment_detail(data)
 	_ensure_fields(MANDATORY_DETAIL_FIELDS, detail, _("Child Validation Error"))
 	amount = flt(detail.get("amount"))
 	if amount <= 0:
 		frappe.throw(_("Amount must be greater than zero"), frappe.ValidationError)
 
-	require_doctype_permission("Company", "read", data["company"])
+	company = cstr(data["company"]).strip()
+	if not frappe.db.exists("Company", company):
+		frappe.throw(_("Invalid company"), frappe.ValidationError)
+	require_doctype_permission("Company", "read", company)
+
+	payment_type = cstr(detail.get("payment_type")).strip().title()
+	if payment_type not in {"Pay", "Receive"}:
+		frappe.throw(_("Unsupported payment type"), frappe.ValidationError)
 	party_type = cstr(detail.get("party_type")).strip()
-	if party_type not in {"Customer", "Supplier", "Employee", "Shareholder"}:
+	if party_type not in PARTY_NAME_FIELDS:
 		frappe.throw(_("Unsupported party type"), frappe.ValidationError)
-	if not frappe.db.exists(party_type, detail["party"]):
+	party = cstr(detail.get("party")).strip()
+	if not frappe.db.exists(party_type, party):
 		frappe.throw(_("Invalid party"), frappe.ValidationError)
-	require_doctype_permission(party_type, "read", detail["party"])
-	if detail.get("mode_of_payment"):
-		if not frappe.db.exists("Mode of Payment", detail["mode_of_payment"]):
+	require_doctype_permission(party_type, "read", party)
+	party_name = cstr(frappe.db.get_value(party_type, party, PARTY_NAME_FIELDS[party_type]) or party)
+
+	mode_of_payment = cstr(detail.get("mode_of_payment")).strip()
+	if mode_of_payment:
+		if not frappe.db.exists("Mode of Payment", mode_of_payment):
 			frappe.throw(_("Invalid mode of payment"), frappe.ValidationError)
-		require_doctype_permission("Mode of Payment", "read", detail["mode_of_payment"])
+		require_doctype_permission("Mode of Payment", "read", mode_of_payment)
 
-	try:
-		doc = frappe.new_doc("Collection and Payment")
-		doc.update(
-			{
-				"posting_date": data["posting_date"],
-				"company": data["company"],
-				"pamper_collection_and_payment": 1,  # force the checkbox
-				"pamper_collection": 1 if doc.meta.has_field("pamper_collection") else None,
-			}
-		)
+	doc = frappe.new_doc("Collection and Payment")
+	parent_values = {
+		"posting_date": data["posting_date"],
+		"company": company,
+		"pamper_collection_and_payment": 1,
+	}
+	if doc.meta.has_field("pamper_collection"):
+		parent_values["pamper_collection"] = 1
+	doc.update(parent_values)
 
-		doc.append(
-			"collection_and_payment_details",
-			{
-				"payment_type": detail["payment_type"],
-				"party_type": detail["party_type"],
-				"party": detail["party"],
-				"party_name": detail["party_name"],
-				"amount": amount,
-				"mode_of_payment": detail.get("mode_of_payment"),
-				"description": detail.get("description"),
-				"is_pamper": 1,
-			},
-		)
+	doc.append(
+		"collection_and_payment_details",
+		{
+			"payment_type": payment_type,
+			"party_type": party_type,
+			"party": party,
+			"party_name": party_name,
+			"amount": amount,
+			"mode_of_payment": mode_of_payment or None,
+			"description": cstr(detail.get("description")),
+			"is_pamper": 1,
+		},
+	)
 
-		doc.insert(ignore_permissions=False)
-		frappe.db.commit()
+	doc.insert(ignore_permissions=False)
 
-		return {
-			"success": True,
-			"message": _("Collection payment created"),
-			"name": doc.name,
-			"posting_date": doc.posting_date,
-		}
-	except frappe.ValidationError as exc:
-		frappe.log_error(frappe.get_traceback(), "Collection Payment ValidationError")
-		frappe.throw(str(exc), title=_("Validation Error"))
-	except Exception as exc:
-		frappe.log_error(frappe.get_traceback(), "Collection Payment Error")
-		frappe.throw(_("Failed to create collection payment: {0}").format(exc), title=_("Server Error"))
+	return {
+		"success": True,
+		"message": _("Collection payment created"),
+		"name": doc.name,
+		"posting_date": doc.posting_date,
+	}
 
 
 # --- API: list -------------------------------------------------------------
 
 
-@frappe.whitelist()
+@frappe.whitelist(allow_guest=True, methods=["GET"])
 def list_collection_payments(page: int = 1, page_size: int = 20):
 	"""
 	GET /api/method/mobile_endpoints.api.payment.list_collection_payments?page=1&page_size=20
@@ -179,12 +202,14 @@ def list_collection_payments(page: int = 1, page_size: int = 20):
 		fields=["name", "posting_date", "company", "owner", "creation", "status"],
 		order_by="creation desc",
 		limit_start=start,
-		limit_page_length=page_size,
+		limit_page_length=page_size + 1,
 	)
 
 	if not parents:
 		return {"payments": [], "has_more": False}
 
+	has_more = len(parents) > page_size
+	parents = parents[:page_size]
 	parent_names = [p["name"] for p in parents]
 	child_rows = frappe.get_all(
 		"Collection and Payment Details",
@@ -227,11 +252,10 @@ def list_collection_payments(page: int = 1, page_size: int = 20):
 			}
 		)
 
-	has_more = len(parents) == page_size
 	return {"payments": results, "has_more": has_more}
 
 
-@frappe.whitelist()
+@frappe.whitelist(allow_guest=True, methods=["GET"])
 def list_mode_of_payments():
 	"""Return enabled Mode of Payment values for mobile UI."""
 	set_cors_headers("GET, OPTIONS")
@@ -247,7 +271,7 @@ def list_mode_of_payments():
 	return {"modes": modes}
 
 
-@frappe.whitelist(methods=["GET"])
+@frappe.whitelist(allow_guest=True, methods=["GET"])
 def get_party_references(limit: int | str = 200):
 	set_cors_headers("GET, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
@@ -261,13 +285,13 @@ def get_party_references(limit: int | str = 200):
 		"Employee",
 		fields=["name", "employee_name"],
 		order_by="modified desc",
-		limit=limit,
+		limit_page_length=limit,
 	)
 	shareholders = frappe.get_list(
 		"Shareholder",
 		fields=["name", "title"],
 		order_by="modified desc",
-		limit=limit,
+		limit_page_length=limit,
 	)
 
 	return {
@@ -290,7 +314,7 @@ def get_party_references(limit: int | str = 200):
 	}
 
 
-@frappe.whitelist(methods=["GET"])
+@frappe.whitelist(allow_guest=True, methods=["GET"])
 def get_today_cashflow():
 	"""
 	GET /api/method/mobile_endpoints.api.payment.get_today_cashflow
@@ -315,8 +339,10 @@ def get_today_cashflow():
 		filters={
 			"pamper_collection_and_payment": 1,
 			"posting_date": today_str,
+			"docstatus": ("!=", 2),
 		},
 		fields=["name", "creation", "status"],
+		limit_page_length=0,
 	)
 
 	if not parents:

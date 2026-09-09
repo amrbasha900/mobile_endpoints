@@ -7,13 +7,29 @@ from frappe.utils.password import get_decrypted_password, set_encrypted_password
 from mobile_endpoints.api.security import require_authenticated_user, set_cors_headers
 
 
-@frappe.whitelist()
+class OAuthConfigurationError(Exception):
+	"""OAuth discovery is unavailable until the site is configured."""
+
+	http_status_code = 503
+
+
+class LegacyLoginDisabledError(Exception):
+	"""The temporary password-to-API-key login has been disabled."""
+
+	http_status_code = 410
+
+
+@frappe.whitelist(allow_guest=True, methods=["GET"])
 def get_user_default_company():
+	set_cors_headers("GET, OPTIONS")
+	if frappe.local.request and frappe.local.request.method == "OPTIONS":
+		return {}
+
 	require_authenticated_user()
 	return {"default_company": get_default_company()}
 
 
-@frappe.whitelist(allow_guest=True)
+@frappe.whitelist(allow_guest=True, methods=["GET"])
 def get_user_profile():
 	set_cors_headers("GET, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
@@ -49,8 +65,8 @@ def get_oauth_config():
 	if not client_id:
 		frappe.throw(
 			_("Pamper OAuth client is not configured"),
+			exc=OAuthConfigurationError,
 			title=_("Configuration Error"),
-			http_status_code=503,
 		)
 	base_url = get_url().rstrip("/")
 	return {
@@ -63,7 +79,7 @@ def get_oauth_config():
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
-def login_with_profile(usr: str, pwd: str):
+def login_with_profile(usr: str | None = None, pwd: str | None = None):
 	"""Deprecated compatibility login; disable after the client migrates to PKCE."""
 	set_cors_headers("POST, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
@@ -72,11 +88,11 @@ def login_with_profile(usr: str, pwd: str):
 	if not usr or not pwd:
 		frappe.throw("Missing credentials", frappe.AuthenticationError)
 
-	if not frappe.conf.get("pamper_allow_legacy_api_key_login", True):
+	if not frappe.conf.get("pamper_allow_legacy_api_key_login", False):
 		frappe.throw(
 			_("Password login is disabled. Use OAuth2 with PKCE."),
+			exc=LegacyLoginDisabledError,
 			title=_("Legacy Login Disabled"),
-			http_status_code=410,
 		)
 
 	frappe.local.response.setdefault("headers", {})["Deprecation"] = "true"
