@@ -1,6 +1,7 @@
 import frappe
 from frappe.utils import cint, cstr
 
+from mobile_endpoints.api._envelope import mobile_api
 from mobile_endpoints.api.security import (
 	require_authenticated_user,
 	require_doctype_permission,
@@ -17,6 +18,7 @@ def _prepare_get_request() -> bool:
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
 def get_supplier(page: int | str = 1, page_size: int | str = 100, search: str | None = None):
 	"""
 	Returns farmer suppliers for the mobile dropdown.
@@ -80,6 +82,7 @@ def get_supplier(page: int | str = 1, page_size: int | str = 100, search: str | 
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
 def get_customer(page: int | str = 1, page_size: int | str = 20, search: str | None = None):
 	doctype = "Customer"
 	if not _prepare_get_request():
@@ -120,6 +123,7 @@ def get_customer(page: int | str = 1, page_size: int | str = 20, search: str | N
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
 def get_items(page: int | str = 1, page_size: int | str = 20, search: str | None = None):
 	doctype = "Item"
 	if not _prepare_get_request():

@@ -4,7 +4,7 @@ from frappe import _
 from frappe.utils import cstr, get_url
 from frappe.utils.password import get_decrypted_password, set_encrypted_password
 
-from mobile_endpoints.api._envelope import CompanyError
+from mobile_endpoints.api._envelope import CompanyError, mobile_api
 from mobile_endpoints.api.security import require_authenticated_user, set_cors_headers
 
 
@@ -22,11 +22,19 @@ class LegacyLoginDisabledError(Exception):
 
 # ---------------------------------------------------------------------------
 # Phase 01 — auth / profile / OAuth discovery (restored from
-# origin/codex/pamper-online-security, unchanged)
+# origin/codex/pamper-online-security). get_user_default_company and
+# get_user_profile now carry the Phase 02 envelope like every other read
+# endpoint. login_with_profile and get_oauth_config deliberately do NOT --
+# they raise LegacyLoginDisabledError (410) / OAuthConfigurationError (503),
+# which are plain Exception subclasses Frappe's own dispatcher renders via
+# their `http_status_code` attribute; @mobile_api's generic `except Exception`
+# would swallow them into an undifferentiated 500, and the existing Phase 01
+# tests assert the raw exception + its status code.
 # ---------------------------------------------------------------------------
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
 def get_user_default_company():
 	set_cors_headers("GET, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
@@ -37,6 +45,7 @@ def get_user_default_company():
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
 def get_user_profile():
 	set_cors_headers("GET, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
@@ -189,6 +198,7 @@ def resolve_company(explicit) -> str:
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
 def list_companies():
 	"""Companies this user may post against, plus the resolved default. One
 	company → the client auto-selects it (no picker); many → the client shows a

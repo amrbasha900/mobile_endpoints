@@ -168,6 +168,7 @@ def _details_dict(doc) -> dict:
 # --- reads (Phase 01, restored verbatim) -----------------------------------
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
 def get_invoice_references(limit: int | str = 200):
 	set_cors_headers("GET, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
@@ -210,6 +211,7 @@ def get_invoice_references(limit: int | str = 200):
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
 def get_invoices(
 	start_date: str | None = None,
 	end_date: str | None = None,
@@ -330,6 +332,7 @@ def get_invoices(
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
 def get_invoice_details(name: str | None = None):
 	set_cors_headers("GET, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
@@ -412,6 +415,7 @@ def get_invoice_details(name: str | None = None):
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
+@mobile_api
 def print_invoice(name: str | None = None, print_format: str | None = None):
 	set_cors_headers("POST, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":

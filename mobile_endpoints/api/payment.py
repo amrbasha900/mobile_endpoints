@@ -194,6 +194,7 @@ def get_payment_by_request_id(client_request_id: str | None = None):
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
 def list_collection_payments(page: int = 1, page_size: int = 20):
 	"""
 	GET /api/method/mobile_endpoints.api.payment.list_collection_payments?page=1&page_size=20
@@ -270,6 +271,7 @@ def list_collection_payments(page: int = 1, page_size: int = 20):
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
 def list_mode_of_payments():
 	"""Return enabled Mode of Payment values for mobile UI."""
 	set_cors_headers("GET, OPTIONS")
@@ -286,6 +288,7 @@ def list_mode_of_payments():
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
 def get_party_references(limit: int | str = 200):
 	set_cors_headers("GET, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
@@ -329,6 +332,7 @@ def get_party_references(limit: int | str = 200):
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
 def get_today_cashflow():
 	"""
 	GET /api/method/mobile_endpoints.api.payment.get_today_cashflow

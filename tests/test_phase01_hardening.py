@@ -47,12 +47,23 @@ if importlib.util.find_spec("frappe") is None:
 	frappe_stub._ = lambda message: message
 	frappe_stub.AuthenticationError = AuthenticationError
 	frappe_stub.PermissionError = PermissionError
+	frappe_stub.DoesNotExistError = type("DoesNotExistError", (Exception,), {"http_status_code": 404})
 	frappe_stub.ValidationError = ValidationError
 	frappe_stub.conf = {}
-	frappe_stub.local = SimpleNamespace(response={}, request=None)
+	frappe_stub.local = SimpleNamespace(response={}, request=None, message_log=[])
 	frappe_stub.session = SimpleNamespace(user="Guest")
 	frappe_stub.whitelist = _whitelist
 	frappe_stub.throw = _throw
+	# Whichever test module's `import frappe` runs first during pytest collection
+	# wins this process-wide sys.modules["frappe"] stub (test_phase02_regression.py
+	# defers to it too when already present). mobile_endpoints.api._envelope binds
+	# `frappe` at import time, so this module-level stub -- not the richer
+	# per-test fake_frappe() below -- is what backs @mobile_api's ok()/exception
+	# mapping for any test here that does not explicitly monkeypatch `_envelope`.
+	frappe_stub.generate_hash = lambda length=10: "0" * int(length or 10)
+	frappe_stub.get_traceback = lambda: "traceback"
+	frappe_stub.log_error = lambda *args, **kwargs: None
+	frappe_stub.db = SimpleNamespace(rollback=lambda: None, commit=lambda: None)
 
 	frappe_utils = types.ModuleType("frappe.utils")
 	frappe_utils.cint = lambda value: int(value or 0)

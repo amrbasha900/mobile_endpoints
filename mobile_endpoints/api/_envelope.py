@@ -158,4 +158,9 @@ def mobile_api(fn):
             return result
         return ok(result)
 
+    # Introspectable marker (not relied on by any runtime behavior) so tests
+    # can assert *exactly one* @mobile_api layer per public endpoint without
+    # guessing from frame/traceback shape -- inspect.unwrap() alone can't tell
+    # "wrapped by mobile_api" apart from Frappe's own typing-validation wrapper.
+    wrapper._mobile_api_wrapped = True
     return wrapper

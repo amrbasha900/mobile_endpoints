@@ -1,7 +1,14 @@
 """Reliability contract tests for the mobile API (Phase 02).
 
 Run on a Frappe bench with the `Invoice Form` and `Collection and Payment`
-doctypes installed:
+doctypes installed. Use scripts/run_reliability_tests.sh from the repo root
+rather than calling `bench run-tests` directly -- on this bench, `bench
+run-tests` can print `FAILED (...)` and still exit 0, so the raw shell exit
+code is not proof of anything:
+
+    ./scripts/run_reliability_tests.sh <site> [bench_dir]
+
+or manually:
 
     bench --site <site> set-config allow_tests True --parse
     bench --site <site> run-tests --app mobile_endpoints \
@@ -11,23 +18,54 @@ doctypes installed:
 These could NOT be executed in the environment where the change was authored
 (no Frappe bench / site) -- they were verified against a real bench separately.
 
+Request-harness policy
+-----------------------
+`frappe.local.request` is built with a REAL `werkzeug.wrappers.Request` (see
+`_build_request`), not a bare `frappe._dict`. Two production code paths read
+it differently -- `security.set_cors_headers` via `request.headers.get(...)`,
+`invoice._parse_payload` via the `request.data` property, `invoice/payment
+._request_meta`/`_extract_payload` via `request.get_data(as_text=True)` -- and
+a `frappe._dict` only ever satisfies the last one (its `.headers`/`.data` are
+`None`, since `frappe._dict.__getattr__` returns `None` for a missing key
+instead of raising). A real Werkzeug request makes `.headers`, `.data`,
+`.get_data()`, and `.get_json()` all behave exactly as they do for a real
+HTTP call, which is what the production code actually depends on and what
+`TestRequestHarness` below proves before anything else here relies on it.
+
+For an endpoint whose signature accepts the JSON body's fields as parameters
+(`update_invoice(name, data)`, `submit_invoke(name)`, ...), a real HTTP call
+has Frappe's own dispatcher bind those directly as keyword arguments *before*
+calling the handler -- calling the Python function with zero arguments and
+relying on it to re-parse its own request body is not equivalent, so the
+helpers below pass those explicitly, exactly as the dispatcher would, while
+still attaching the full raw body to `frappe.local.request` so the endpoint's
+own `_request_meta()`/`_extract_payload()` (used for fields that are NOT part
+of the signature, like `client_request_id` and `base_modified`) sees the same
+thing a real request would carry.
+
 Fixture policy
 --------------
 This suite must be safe to run against a real deployment, not just a
 freshly-seeded dev site: it does NOT depend on ERPNext's `_Test *` demo
 records (a live site may never have had them loaded), and it does NOT read or
 write arbitrary pre-existing / production documents. Master data (Supplier,
-Customer, Item) is created under a deterministic `MEP-RELIABILITY-TEST-*` name
-so reruns reuse the same fixture instead of accumulating duplicates, and is
-left in place between runs (cheap, inert, clearly named). Every *transactional*
-document a test creates (Invoice Form, Collection and Payment, and their
-`Mobile Request Log` idempotency rows) is tracked and deleted in that test's
-tearDown -- `run_idempotent()` commits on success, so these rows are real
-commits that a `FrappeTestCase` rollback will NOT undo for us.
+Customer, Item, Mode of Payment) is created under a deterministic
+`MEP-RELIABILITY-TEST-*` name so reruns reuse the same fixture instead of
+accumulating duplicates, and is left in place between runs (cheap, inert,
+clearly named). Every *transactional* document a test creates (Invoice Form,
+Collection and Payment, and their `Mobile Request Log` idempotency rows) is
+tracked and deleted in that test's tearDown -- `run_idempotent()` commits on
+success, so these rows are real commits that a `FrappeTestCase` rollback will
+NOT undo for us.
 
 A Company is required (creating one has heavy chart-of-accounts side effects,
 so the suite reuses whatever is already configured instead of creating one) --
-the whole module skips with a clear reason if the site has none.
+the whole module skips with a clear reason if the site has none. A Mode of
+Payment is created the same deterministic/reused way for the payment tests;
+if this site's ERP configuration makes even a minimal Mode of Payment
+impossible to create (a genuine prerequisite gap, not a mistake in our own
+validation), only the payment test class skips, with the underlying error
+message included.
 """
 
 from __future__ import annotations
@@ -39,6 +77,8 @@ import uuid
 from unittest import mock
 
 import frappe
+import werkzeug.test
+import werkzeug.wrappers
 from frappe.tests.utils import FrappeTestCase
 
 from mobile_endpoints.api import invoice as invoice_api
@@ -52,26 +92,23 @@ TEST_PREFIX = "MEP-RELIABILITY-TEST"
 
 
 # --------------------------------------------------------------------------- #
-#  request simulation                                                        #
+#  request simulation -- real Werkzeug requests, not a bare frappe._dict      #
 # --------------------------------------------------------------------------- #
 
 
+def _build_request(method: str, body: dict | None = None) -> werkzeug.wrappers.Request:
+	data = json.dumps(body).encode("utf-8") if body is not None else b""
+	environ = werkzeug.test.EnvironBuilder(method=method, data=data, content_type="application/json").get_environ()
+	return werkzeug.wrappers.Request(environ)
+
+
 def _set_post_body(body: dict) -> None:
-	"""Simulate an authenticated POST the way a real non-browser call (native
-	app, server-to-server, or this test runner) arrives: `frappe.local.request`
-	deliberately has NO `headers` attribute, matching the bare `frappe._dict`
-	Frappe leaves behind outside a real werkzeug HTTP cycle. `set_cors_headers`
-	must tolerate this -- it previously crashed with
-	`AttributeError: 'NoneType' object has no attribute 'get'` because
-	`frappe._dict.__getattr__` returns `None` (not a raise) for the missing
-	`headers` key, and every endpoint calls it before any of its own logic.
-	"""
-	frappe.local.request = frappe._dict(method="POST", get_data=lambda as_text=True: json.dumps(body))
+	frappe.local.request = _build_request("POST", body)
 	frappe.form_dict = frappe._dict()
 
 
 def _set_get_request() -> None:
-	frappe.local.request = frappe._dict(method="GET")
+	frappe.local.request = _build_request("GET")
 
 
 def _dump(resp) -> str:
@@ -92,19 +129,6 @@ def _expect_success(resp, context: str = "") -> dict:
 	return resp["data"]
 
 
-def _invoice_body(client_request_id, supplier: str, item_code: str, qty=2, price=50):
-	body = {
-		"data": {
-			"posting_date": frappe.utils.today(),
-			"supplier": supplier,
-			"items": [{"item_code": item_code, "qty": qty, "price": price}],
-		},
-	}
-	if client_request_id is not None:
-		body["client_request_id"] = client_request_id
-	return body
-
-
 def _first_existing(doctype: str, filters=None) -> str | None:
 	return frappe.db.get_value(doctype, filters or {}, "name")
 
@@ -120,6 +144,36 @@ def _find_or_create(doctype: str, filters: dict, values: dict):
 	doc.insert(ignore_permissions=True)
 	frappe.db.commit()
 	return doc
+
+
+# --------------------------------------------------------------------------- #
+#  request-harness self-check (item 1) -- run before anything trusts it       #
+# --------------------------------------------------------------------------- #
+
+
+class TestRequestHarness(FrappeTestCase):
+	"""Proves _build_request()/_set_post_body()/_set_get_request() actually
+	produce a request every production code path can read, BEFORE the
+	idempotency/concurrency tests below rely on it."""
+
+	def test_post_json_request_round_trips_the_body(self):
+		body = {"posting_date": "2026-01-01", "items": [{"item_code": "X", "qty": 1}], "client_request_id": "abc"}
+		_set_post_body(body)
+
+		self.assertEqual(frappe.request.method, "POST")
+		self.assertEqual(frappe.request.headers.get("Content-Type"), "application/json")
+		# The three ways production code reads the body must all agree:
+		self.assertEqual(frappe.request.get_json(), body)  # operation.py-style
+		self.assertEqual(json.loads(frappe.request.get_data(as_text=True)), body)  # _request_meta/_extract_payload
+		self.assertEqual(frappe.request.data, json.dumps(body).encode("utf-8"))  # invoice._parse_payload fallback
+
+	def test_get_request_has_real_headers_and_no_body(self):
+		_set_get_request()
+		self.assertEqual(frappe.request.method, "GET")
+		# A real Headers mapping, not None -- this is the exact call that
+		# crashed set_cors_headers on a bare frappe._dict.
+		self.assertIsNone(frappe.request.headers.get("Origin"))
+		self.assertEqual(frappe.request.get_data(as_text=True), "")
 
 
 # --------------------------------------------------------------------------- #
@@ -213,10 +267,21 @@ class ReliabilityTestCase(FrappeTestCase):
 		if client_request_id:
 			self.track(LOG_DOCTYPE, _composite(user or frappe.session.user, scope, client_request_id))
 
-	# -- convenience wrappers: call the real endpoint AND register cleanup --
+	# -- convenience wrappers: call the real endpoint the way a real HTTP
+	#    request would (Frappe's dispatcher binds body fields matching the
+	#    signature as kwargs) AND register cleanup --
 
-	def create_invoice(self, client_request_id, **kw) -> dict:
-		_set_post_body(_invoice_body(client_request_id, self.supplier, self.item_code, **kw))
+	def create_invoice(self, client_request_id, qty=2, price=50) -> dict:
+		body = {
+			"posting_date": frappe.utils.today(),
+			"supplier": self.supplier,
+			"items": [{"item_code": self.item_code, "qty": qty, "price": price}],
+		}
+		if client_request_id is not None:
+			body["client_request_id"] = client_request_id
+		# create_invoice_form() takes no parameters -- everything is read from
+		# the raw body, exactly like a real POST with no dispatcher-bound args.
+		_set_post_body(body)
 		resp = invoice_api.create_invoice_form()
 		if resp.get("success"):
 			self.track("Invoice Form", resp["data"].get("name"))
@@ -225,6 +290,31 @@ class ReliabilityTestCase(FrappeTestCase):
 
 	def create_invoice_ok(self, client_request_id, **kw) -> dict:
 		return _expect_success(self.create_invoice(client_request_id, **kw), "create_invoice_form")
+
+	def update_invoice(self, name: str, items: list[dict], base_modified: str, client_request_id=None) -> dict:
+		data = {"items": items}
+		full_body = {"name": name, "data": data, "base_modified": base_modified}
+		if client_request_id is not None:
+			full_body["client_request_id"] = client_request_id
+		_set_post_body(full_body)
+		# name/data ARE in update_invoice's signature -- a real dispatched call
+		# binds them directly; base_modified/client_request_id are not, and
+		# reach the handler only via _request_meta() reading the raw body above.
+		return invoice_api.update_invoice(name=name, data=data)
+
+	def submit_invoice(self, name: str, client_request_id=None) -> dict:
+		body = {"name": name}
+		if client_request_id is not None:
+			body["client_request_id"] = client_request_id
+		_set_post_body(body)
+		return invoice_api.submit_invoice(name=name)
+
+	def delete_invoice(self, name: str, client_request_id=None) -> dict:
+		body = {"name": name}
+		if client_request_id is not None:
+			body["client_request_id"] = client_request_id
+		_set_post_body(body)
+		return invoice_api.delete_invoice(name=name)
 
 
 # --------------------------------------------------------------------------- #
@@ -264,7 +354,7 @@ class TestIdempotentCreate(ReliabilityTestCase):
 	def test_failed_operation_leaves_no_completed_log(self):
 		key = str(uuid.uuid4())
 		# Missing required fields (no supplier, no items) -> _do raises before insert.
-		_set_post_body({"client_request_id": key, "data": {"posting_date": frappe.utils.today()}})
+		_set_post_body({"client_request_id": key, "posting_date": frappe.utils.today()})
 		resp = invoice_api.create_invoice_form()
 		self.assertFalse(resp["success"])
 		self.assertEqual(resp["error"]["code"], "validation_error")
@@ -280,8 +370,7 @@ class TestIdempotentCreate(ReliabilityTestCase):
 		key = str(uuid.uuid4())
 		created = self.create_invoice_ok(key)["name"]
 
-		_set_post_body({"client_request_id": key, "name": created})
-		submitted = invoice_api.submit_invoice()
+		submitted = self.submit_invoice(created, client_request_id=key)
 		self.track_log("invoice.submit", key)
 		# Different scope -> different composite key -> the submit is NOT treated
 		# as a replay of the create.
@@ -309,9 +398,9 @@ class TestCrossUserIsolation(ReliabilityTestCase):
 class TestOptimisticConcurrency(ReliabilityTestCase):
 	def test_stale_base_modified_returns_409_with_current_state(self):
 		created = self.create_invoice_ok(str(uuid.uuid4()))
-		resp = invoice_api.update_invoice(
+		resp = self.update_invoice(
 			name=created["name"],
-			data={"items": [{"item_code": self.item_code, "qty": 3, "price": 10}]},
+			items=[{"item_code": self.item_code, "qty": 3, "price": 10}],
 			base_modified="1999-01-01 00:00:00.000000",
 		)
 		self.assertFalse(resp["success"], f"expected a 409 conflict, got:\n{_dump(resp)}")
@@ -322,21 +411,21 @@ class TestOptimisticConcurrency(ReliabilityTestCase):
 	def test_matching_base_modified_updates_and_replays(self):
 		created = self.create_invoice_ok(str(uuid.uuid4()))
 		key = str(uuid.uuid4())
-		update_body = {
-			"client_request_id": key,
-			"name": created["name"],
-			"data": {"items": [{"item_code": self.item_code, "qty": 3, "price": 10}]},
-			"base_modified": created["modified"],
-		}
-		_set_post_body(update_body)
-		first = _expect_success(invoice_api.update_invoice(), "update_invoice")
+		items = [{"item_code": self.item_code, "qty": 3, "price": 10}]
+
+		first = _expect_success(
+			self.update_invoice(created["name"], items, created["modified"], client_request_id=key),
+			"update_invoice",
+		)
 		self.track_log("invoice.update", key)
 		self.assertEqual(first["grand_total"], 30)
 
 		# Replay with the same key returns the stored result even though
 		# base_modified would now be stale.
-		_set_post_body(update_body)
-		replay = _expect_success(invoice_api.update_invoice(), "update_invoice (replay)")
+		replay = _expect_success(
+			self.update_invoice(created["name"], items, created["modified"], client_request_id=key),
+			"update_invoice (replay)",
+		)
 		self.assertEqual(replay["grand_total"], 30)
 
 
@@ -345,28 +434,44 @@ class TestDeleteOutcome(ReliabilityTestCase):
 		created = self.create_invoice_ok(str(uuid.uuid4()))["name"]
 		key = str(uuid.uuid4())
 
-		_set_post_body({"client_request_id": key, "name": created})
-		first = _expect_success(invoice_api.delete_invoice(), "delete_invoice")
+		first = _expect_success(self.delete_invoice(created, client_request_id=key), "delete_invoice")
 		self.track_log("invoice.delete", key)
 		self.assertTrue(first["deleted"])
 
-		_set_post_body({"client_request_id": key, "name": created})
-		replay = _expect_success(invoice_api.delete_invoice(), "delete_invoice (replay)")
+		replay = _expect_success(self.delete_invoice(created, client_request_id=key), "delete_invoice (replay)")
 		self.assertTrue(replay["deleted"], "replay of the deleting request id must not 404")
 
-		_set_post_body({"client_request_id": str(uuid.uuid4()), "name": created})
-		other = invoice_api.delete_invoice()
+		other = self.delete_invoice(created, client_request_id=str(uuid.uuid4()))
 		self.assertFalse(other["success"])
 		self.assertEqual(other["error"]["code"], "not_found")
 		self.assertEqual(frappe.local.response.get("http_status_code"), 404)
 
 
 # --------------------------------------------------------------------------- #
-#  payment company resolution (BR-06)                                        #
+#  payment company resolution (BR-06) + idempotency                          #
 # --------------------------------------------------------------------------- #
 
 
 class TestPaymentCompany(ReliabilityTestCase):
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		try:
+			cls.mode_of_payment = _find_or_create(
+				"Mode of Payment",
+				{"mode_of_payment": f"{TEST_PREFIX}-MODE-OF-PAYMENT"},
+				{"mode_of_payment": f"{TEST_PREFIX}-MODE-OF-PAYMENT", "type": "Cash", "enabled": 1},
+			).name
+		except Exception as exc:
+			# A genuine ERP prerequisite this suite cannot satisfy on its own
+			# (e.g. a mandatory per-company account mapping) -- not a mistake
+			# in our own request/validation logic. Skip only this class, with
+			# the underlying error so it's actionable.
+			raise unittest.SkipTest(
+				f"could not create a minimal test Mode of Payment "
+				f"('{TEST_PREFIX}-MODE-OF-PAYMENT') on this site: {exc}"
+			) from exc
+
 	def setUp(self):
 		super().setUp()
 		# Save/restore Administrator's real default -- these tests must not
@@ -390,33 +495,33 @@ class TestPaymentCompany(ReliabilityTestCase):
 				"party": self.customer,
 				"party_name": self.customer,
 				"amount": 10,
+				"mode_of_payment": self.mode_of_payment,
 			},
 		}
 		if company is not None:
 			body["company"] = company
 		return body
 
-	def _track_payment(self, resp, client_request_id):
+	def _create_payment(self, body: dict) -> dict:
+		_set_post_body(body)
+		resp = payment_api.create_collection_payment()
 		if resp.get("success"):
 			self.track("Collection and Payment", resp["data"].get("name"))
-			self.track_log("payment.create", client_request_id)
+			self.track_log("payment.create", body["client_request_id"])
+		return resp
 
 	def test_missing_company_resolves_the_user_default(self):
 		# NB: the resolver reads the lowercase "company" default key
 		# (`frappe.defaults.get_user_default("company")`, matching the DocType
 		# fieldname) -- setting "Company" here would silently miss it.
 		frappe.defaults.set_user_default("company", self.company)
-		body = self._payment_body()
-		_set_post_body(body)
-		resp = payment_api.create_collection_payment()
-		self._track_payment(resp, body["client_request_id"])
+		resp = self._create_payment(self._payment_body())
 		data = _expect_success(resp, "create_collection_payment")
 		self.assertEqual(data["company"], self.company)
 
 	def test_forbidden_company_returns_422_with_field(self):
 		bogus_company = f"{TEST_PREFIX}-NO-SUCH-COMPANY-{uuid.uuid4()}"
-		_set_post_body(self._payment_body(company=bogus_company))
-		resp = payment_api.create_collection_payment()
+		resp = self._create_payment(self._payment_body(company=bogus_company))
 		self.assertFalse(resp["success"], f"expected a 422, got:\n{_dump(resp)}")
 		self.assertEqual(resp["error"]["code"], "validation_error")
 		self.assertIn("company", resp["error"]["fields"])
@@ -428,10 +533,7 @@ class TestPaymentCompany(ReliabilityTestCase):
 		# Administrator; otherwise resolve_company() auto-selects the single one.
 		if frappe.db.count("Company") < 2:
 			self.skipTest("test site does not expose more than one Company")
-		body = self._payment_body()
-		_set_post_body(body)
-		resp = payment_api.create_collection_payment()
-		self._track_payment(resp, body["client_request_id"])
+		resp = self._create_payment(self._payment_body())
 		if resp["success"]:
 			# A configured Global Defaults default_company still resolves it --
 			# that's not something a test may reconfigure on a real site.
@@ -439,6 +541,19 @@ class TestPaymentCompany(ReliabilityTestCase):
 		self.assertEqual(resp["error"]["code"], "validation_error")
 		self.assertIn("company", resp["error"]["fields"])
 		self.assertEqual(frappe.local.response.get("http_status_code"), 422)
+
+	def test_payment_replay_does_not_duplicate(self):
+		frappe.defaults.set_user_default("company", self.company)
+		body = self._payment_body()
+
+		first = _expect_success(self._create_payment(body), "create_collection_payment")
+		before = frappe.db.count("Collection and Payment")
+
+		second = _expect_success(self._create_payment(body), "create_collection_payment (replay)")
+		after = frappe.db.count("Collection and Payment")
+
+		self.assertEqual(second["name"], first["name"])
+		self.assertEqual(before, after, "replaying the same payment key created a duplicate")
 
 
 # --------------------------------------------------------------------------- #
@@ -466,8 +581,50 @@ class TestOperationStatus(ReliabilityTestCase):
 
 
 class TestEnvelope(ReliabilityTestCase):
-	def test_permission_error_is_structured_403(self):
+	def test_guest_is_401_not_authenticated(self):
+		"""Unauthenticated (Guest) -> AUTH_REQUIRED / 401. get_invoices() is now
+		@mobile_api-wrapped, so this used to escape as a raw AuthenticationError
+		instead of a structured envelope."""
 		frappe.set_user("Guest")
+		try:
+			_set_get_request()
+			resp = invoice_api.get_invoices()
+		finally:
+			frappe.set_user("Administrator")
+		self.assertFalse(resp["success"])
+		self.assertEqual(resp["error"]["code"], "not_authenticated")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 401)
+
+	def test_authenticated_but_forbidden_is_403_permission_denied(self):
+		"""A distinct scenario from the Guest/401 case above: an authenticated
+		user who genuinely lacks read permission on Invoice Form."""
+		user_email = f"{TEST_PREFIX.lower()}-no-access@example.invalid"
+		if not frappe.db.exists("User", user_email):
+			frappe.get_doc(
+				{
+					"doctype": "User",
+					"email": user_email,
+					"first_name": "MEP Reliability No-Access",
+					"send_welcome_email": 0,
+					"user_type": "System User",
+					"roles": [],
+				}
+			).insert(ignore_permissions=True)
+			frappe.db.commit()
+
+		frappe.set_user(user_email)
+		try:
+			has_read = frappe.has_permission(doctype="Invoice Form", ptype="read")
+		finally:
+			frappe.set_user("Administrator")
+		if has_read:
+			self.skipTest(
+				f"'{user_email}' (no custom roles) can still read Invoice Form on this "
+				"site's permission configuration -- the 403 path cannot be exercised "
+				"without reconfiguring real site permissions"
+			)
+
+		frappe.set_user(user_email)
 		try:
 			_set_get_request()
 			resp = invoice_api.get_invoices()
@@ -517,7 +674,7 @@ class TestEnvelope(ReliabilityTestCase):
 
 
 # --------------------------------------------------------------------------- #
-#  CORS header safety (the real-bench regression)                            #
+#  CORS header safety (the earlier real-bench regression)                    #
 # --------------------------------------------------------------------------- #
 
 
