@@ -34,9 +34,21 @@ def set_cors_headers(methods: str) -> None:
 	Native Android/iOS calls do not need CORS. Web origins must be listed exactly
 	in the site's ``allow_cors`` setting. A wildcard is deliberately ignored here
 	because reflecting arbitrary origins together with credentials is unsafe.
+
+	``frappe.local.request`` is not always a real werkzeug request: a background
+	job, a console call, or (in the test harness) a bare ``frappe._dict`` leaves
+	it either missing or without a ``headers`` key. ``frappe._dict.__getattr__``
+	then returns ``None`` instead of raising, so ``request.headers`` must never
+	be dereferenced directly -- doing so previously crashed every endpoint with
+	``AttributeError: 'NoneType' object has no attribute 'get'`` before the
+	handler's own logic (auth, validation, ...) ever ran.
 	"""
 	request = getattr(frappe.local, "request", None)
-	origin = cstr(request.headers.get("Origin") if request else "").strip().rstrip("/")
+	headers = getattr(request, "headers", None) if request is not None else None
+	if headers is None:
+		headers = {}
+	get_header = getattr(headers, "get", None) or (lambda *_a: None)
+	origin = cstr(get_header("Origin") or "").strip().rstrip("/")
 	allowed = _configured_origins()
 	if not origin or origin not in allowed:
 		return

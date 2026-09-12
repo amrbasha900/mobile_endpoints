@@ -286,6 +286,64 @@ def test_cors_headers_only_reflect_an_allowlisted_origin(monkeypatch):
 	assert "Access-Control-Allow-Credentials" not in headers  # never with a reflected origin
 
 
+class _FrappeDict(dict):
+	"""Minimal stand-in for frappe._dict: missing attributes resolve to None
+	instead of raising AttributeError -- this is what made a bare test/console
+	request (no real werkzeug `.headers`) crash set_cors_headers in the real
+	bench run (`AttributeError: 'NoneType' object has no attribute 'get'`)."""
+
+	def __getattr__(self, key):
+		return self.get(key)
+
+
+def test_cors_set_cors_headers_survives_request_is_none(monkeypatch):
+	runtime = fake_frappe(config={"allow_cors": '["https://app.pamper.example"]'})
+	runtime.local.request = None
+	_patch(monkeypatch, security, runtime)
+
+	security.set_cors_headers("GET, OPTIONS")  # must not raise
+	assert runtime.local.response == {}
+
+
+def test_cors_set_cors_headers_survives_request_headers_is_none(monkeypatch):
+	runtime = fake_frappe(config={"allow_cors": '["https://app.pamper.example"]'})
+	runtime.local.request = _FrappeDict(method="POST")  # no "headers" key -> .headers is None
+	assert runtime.local.request.headers is None
+	_patch(monkeypatch, security, runtime)
+
+	security.set_cors_headers("POST, OPTIONS")  # must not raise
+	assert runtime.local.response == {}
+
+
+def test_cors_missing_origin_sets_no_header(monkeypatch):
+	runtime = fake_frappe(config={"allow_cors": '["https://app.pamper.example"]'})
+	runtime.local.request = SimpleNamespace(headers={})  # Origin key absent entirely
+	_patch(monkeypatch, security, runtime)
+
+	security.set_cors_headers("GET, OPTIONS")
+	assert runtime.local.response == {}
+
+
+def test_cors_allowed_origin_gets_reflected(monkeypatch):
+	runtime = fake_frappe(config={"allow_cors": '["https://app.pamper.example"]'})
+	runtime.local.request = SimpleNamespace(headers={"Origin": "https://app.pamper.example"})
+	_patch(monkeypatch, security, runtime)
+
+	security.set_cors_headers("GET, OPTIONS")
+	headers = runtime.local.response["headers"]
+	assert headers["Access-Control-Allow-Origin"] == "https://app.pamper.example"
+	assert headers["Vary"] == "Origin"
+
+
+def test_cors_disallowed_origin_gets_no_header(monkeypatch):
+	runtime = fake_frappe(config={"allow_cors": '["https://app.pamper.example"]'})
+	runtime.local.request = SimpleNamespace(headers={"Origin": "https://attacker.example"})
+	_patch(monkeypatch, security, runtime)
+
+	security.set_cors_headers("GET, OPTIONS")
+	assert runtime.local.response == {}
+
+
 # --------------------------------------------------------------------------- #
 #  Phase 02 additions still work                                              #
 # --------------------------------------------------------------------------- #
@@ -436,6 +494,26 @@ def test_get_operation_status_rejects_unknown_scope(monkeypatch):
 	assert result["success"] is False
 	assert result["error"]["code"] == "validation_error"
 	assert result["error"]["fields"] == {"scope": "invalid"}
+
+
+def test_get_operation_status_end_to_end_with_headerless_request_is_422_not_500(monkeypatch):
+	"""Regression: on the real bench, `frappe.local.request` for a test/console
+	call has no real werkzeug `.headers`. Every endpoint calls set_cors_headers()
+	FIRST -- unlike the test above, this one does NOT stub it out, so it
+	reproduces the exact failure the bench run reported: an unhandled
+	AttributeError inside set_cors_headers made @mobile_api report a sanitized
+	500 server_error for what should have been a clean 422 validation_error."""
+	runtime = fake_frappe()
+	runtime.local.request = _FrappeDict(method="GET")
+	_patch(monkeypatch, operation, runtime)
+	_patch(monkeypatch, security, runtime)
+	_patch(monkeypatch, _envelope, runtime)
+
+	result = operation.get_operation_status(client_request_id="r1", scope="bogus.scope")
+	assert result["success"] is False
+	assert result["error"]["code"] == "validation_error"
+	assert result["error"]["fields"] == {"scope": "invalid"}
+	assert runtime.local.response.get("http_status_code") == 422
 
 
 def test_mobile_api_maps_authentication_error_to_401(monkeypatch):
