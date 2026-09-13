@@ -49,7 +49,7 @@ This suite must be safe to run against a real deployment, not just a
 freshly-seeded dev site: it does NOT depend on ERPNext's `_Test *` demo
 records (a live site may never have had them loaded), and it does NOT read or
 write arbitrary pre-existing / production documents. Master data (Supplier,
-Customer, Item, Mode of Payment) is created under a deterministic
+Customer, Item, Role/User, Mode of Payment) is created under a deterministic
 `MEP-RELIABILITY-TEST-*` name so reruns reuse the same fixture instead of
 accumulating duplicates, and is left in place between runs (cheap, inert,
 clearly named). Every *transactional* document a test creates (Invoice Form,
@@ -89,6 +89,8 @@ from mobile_endpoints.api._idempotency import DOCTYPE as LOG_DOCTYPE
 from mobile_endpoints.api._idempotency import _composite
 
 TEST_PREFIX = "MEP-RELIABILITY-TEST"
+TEST_USER_EMAIL = f"{TEST_PREFIX.lower()}-no-access@example.invalid"
+TEST_ROLE = f"{TEST_PREFIX}-NO-ACCESS"
 
 
 # --------------------------------------------------------------------------- #
@@ -102,13 +104,28 @@ def _build_request(method: str, body: dict | None = None) -> werkzeug.wrappers.R
 	return werkzeug.wrappers.Request(environ)
 
 
+def _reset_http_state(request: werkzeug.wrappers.Request) -> None:
+	"""Start a fresh direct-call request without rebinding Frappe's proxies.
+
+	``frappe.form_dict`` is a LocalProxy. Assigning to the module attribute
+	replaces the proxy process-wide; the request-local value belongs on
+	``frappe.local.form_dict`` instead. Direct handler calls also reuse the
+	current Local object, so response status, message log and request id must
+	be reset just like Frappe does for a real HTTP request.
+	"""
+	frappe.local.request = request
+	frappe.local.form_dict = frappe._dict()
+	frappe.local.response = frappe._dict()
+	frappe.local.message_log = []
+	frappe.local.mobile_request_id = None
+
+
 def _set_post_body(body: dict) -> None:
-	frappe.local.request = _build_request("POST", body)
-	frappe.form_dict = frappe._dict()
+	_reset_http_state(_build_request("POST", body))
 
 
 def _set_get_request() -> None:
-	frappe.local.request = _build_request("GET")
+	_reset_http_state(_build_request("GET"))
 
 
 def _dump(resp) -> str:
@@ -146,6 +163,52 @@ def _find_or_create(doctype: str, filters: dict, values: dict):
 	return doc
 
 
+def _test_user() -> str:
+	"""Return an authenticated System User with a role that grants no API
+	document permissions. Only clearly named test fixtures are created or
+	repaired; no existing production user's roles are touched."""
+	if not frappe.db.exists("Role", TEST_ROLE):
+		frappe.get_doc(
+			{
+				"doctype": "Role",
+				"role_name": TEST_ROLE,
+				"desk_access": 1,
+			}
+		).insert(ignore_permissions=True)
+
+	if frappe.db.exists("User", TEST_USER_EMAIL):
+		user = frappe.get_doc("User", TEST_USER_EMAIL)
+	else:
+		user = frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": TEST_USER_EMAIL,
+				"first_name": "MEP Reliability No Access",
+				"send_welcome_email": 0,
+				"enabled": 1,
+				"user_type": "System User",
+			}
+		)
+
+	needs_save = False
+	if user.get("user_type") != "System User":
+		user.user_type = "System User"
+		needs_save = True
+	if not user.get("enabled"):
+		user.enabled = 1
+		needs_save = True
+	role_added = TEST_ROLE not in {row.role for row in (user.get("roles") or [])}
+	if role_added:
+		user.append("roles", {"role": TEST_ROLE})
+		needs_save = True
+	if user.is_new():
+		user.insert(ignore_permissions=True)
+	elif needs_save:
+		user.save(ignore_permissions=True)
+	frappe.db.commit()
+	return user.name
+
+
 # --------------------------------------------------------------------------- #
 #  request-harness self-check (item 1) -- run before anything trusts it       #
 # --------------------------------------------------------------------------- #
@@ -158,6 +221,7 @@ class TestRequestHarness(FrappeTestCase):
 
 	def test_post_json_request_round_trips_the_body(self):
 		body = {"posting_date": "2026-01-01", "items": [{"item_code": "X", "qty": 1}], "client_request_id": "abc"}
+		form_dict_proxy = frappe.form_dict
 		_set_post_body(body)
 
 		self.assertEqual(frappe.request.method, "POST")
@@ -166,14 +230,19 @@ class TestRequestHarness(FrappeTestCase):
 		self.assertEqual(frappe.request.get_json(), body)  # operation.py-style
 		self.assertEqual(json.loads(frappe.request.get_data(as_text=True)), body)  # _request_meta/_extract_payload
 		self.assertEqual(frappe.request.data, json.dumps(body).encode("utf-8"))  # invoice._parse_payload fallback
+		self.assertIs(frappe.form_dict, form_dict_proxy, "the frappe.form_dict LocalProxy was rebound")
 
 	def test_get_request_has_real_headers_and_no_body(self):
+		frappe.local.message_log = [{"message": "stale"}]
+		frappe.local.mobile_request_id = "stale-request-id"
 		_set_get_request()
 		self.assertEqual(frappe.request.method, "GET")
 		# A real Headers mapping, not None -- this is the exact call that
 		# crashed set_cors_headers on a bare frappe._dict.
 		self.assertIsNone(frappe.request.headers.get("Origin"))
 		self.assertEqual(frappe.request.get_data(as_text=True), "")
+		self.assertEqual(frappe.local.message_log, [])
+		self.assertIsNone(frappe.local.mobile_request_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -226,19 +295,22 @@ class ReliabilityTestCase(FrappeTestCase):
 		).name
 
 		item_code = f"{TEST_PREFIX}-ITEM"
-		if not frappe.db.exists("Item", item_code):
-			frappe.get_doc(
-				{
-					"doctype": "Item",
-					"item_code": item_code,
-					"item_name": item_code,
-					"item_group": item_group,
-					"stock_uom": uom,
-					"is_stock_item": 0,
-				}
-			).insert(ignore_permissions=True)
-			frappe.db.commit()
-		cls.item_code = item_code
+		item = _find_or_create(
+			"Item",
+			{"item_code": item_code},
+			{
+				"item_code": item_code,
+				"item_name": item_code,
+				"item_group": item_group,
+				"stock_uom": uom,
+				"is_stock_item": 0,
+				"disabled": 0,
+			},
+		)
+		# ERPNext may name Items from a naming series. The API Link field must
+		# receive the actual document name, not the requested item_code.
+		cls.item_code = item.name
+		cls.other_user = _test_user()
 
 	def setUp(self):
 		super().setUp()
@@ -247,7 +319,11 @@ class ReliabilityTestCase(FrappeTestCase):
 		# handlers directly, back-to-back, in one test process does not --
 		# reset it so one test's http_status_code/headers can't leak into the
 		# next test's assertions.
+		frappe.local.request = None
+		frappe.local.form_dict = frappe._dict()
 		frappe.local.response = frappe._dict()
+		frappe.local.message_log = []
+		frappe.local.mobile_request_id = None
 		self._docs_to_delete: list[tuple[str, str]] = []
 
 	def tearDown(self):
@@ -383,15 +459,17 @@ class TestCrossUserIsolation(ReliabilityTestCase):
 		key = str(uuid.uuid4())
 		self.create_invoice_ok(key)  # as Administrator
 
-		frappe.set_user("Guest")
+		frappe.set_user(self.other_user)
 		try:
 			_set_get_request()
 			status = operation_api.get_operation_status(client_request_id=key, scope="invoice.create")
 		finally:
 			frappe.set_user("Administrator")
 
-		# Guest's composite key differs -> the Administrator's result is invisible.
-		data = _expect_success(status, "get_operation_status (as Guest)")
+		# A different authenticated user's composite key differs, so the
+		# Administrator's result is invisible without weakening the endpoint's
+		# Phase 01 authentication requirement.
+		data = _expect_success(status, "get_operation_status (as another user)")
 		self.assertFalse(data["found"])
 
 
@@ -457,7 +535,11 @@ class TestPaymentCompany(ReliabilityTestCase):
 	def setUpClass(cls):
 		super().setUpClass()
 		try:
-			cls.mode_of_payment = _find_or_create(
+			# Referencing an existing enabled mode is read-only and exercises
+			# the same configured master data the app uses. Create a clearly
+			# named fixture only on a site that has no enabled mode at all.
+			existing = frappe.db.get_value("Mode of Payment", {"enabled": 1}, "name")
+			cls.mode_of_payment = existing or _find_or_create(
 				"Mode of Payment",
 				{"mode_of_payment": f"{TEST_PREFIX}-MODE-OF-PAYMENT"},
 				{"mode_of_payment": f"{TEST_PREFIX}-MODE-OF-PAYMENT", "type": "Cash", "enabled": 1},
@@ -598,33 +680,19 @@ class TestEnvelope(ReliabilityTestCase):
 	def test_authenticated_but_forbidden_is_403_permission_denied(self):
 		"""A distinct scenario from the Guest/401 case above: an authenticated
 		user who genuinely lacks read permission on Invoice Form."""
-		user_email = f"{TEST_PREFIX.lower()}-no-access@example.invalid"
-		if not frappe.db.exists("User", user_email):
-			frappe.get_doc(
-				{
-					"doctype": "User",
-					"email": user_email,
-					"first_name": "MEP Reliability No-Access",
-					"send_welcome_email": 0,
-					"user_type": "System User",
-					"roles": [],
-				}
-			).insert(ignore_permissions=True)
-			frappe.db.commit()
-
-		frappe.set_user(user_email)
+		frappe.set_user(self.other_user)
 		try:
 			has_read = frappe.has_permission(doctype="Invoice Form", ptype="read")
 		finally:
 			frappe.set_user("Administrator")
 		if has_read:
 			self.skipTest(
-				f"'{user_email}' (no custom roles) can still read Invoice Form on this "
+				f"'{self.other_user}' (test-only role) can still read Invoice Form on this "
 				"site's permission configuration -- the 403 path cannot be exercised "
 				"without reconfiguring real site permissions"
 			)
 
-		frappe.set_user(user_email)
+		frappe.set_user(self.other_user)
 		try:
 			_set_get_request()
 			resp = invoice_api.get_invoices()

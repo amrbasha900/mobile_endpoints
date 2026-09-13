@@ -32,7 +32,7 @@ def _hash_payload(payload) -> str:
 def _composite(user: str, scope: str, key: str) -> str:
     """Deterministic primary key, scoped by user + operation. Hashing keeps it a
     fixed 64 chars regardless of the user's email length."""
-    raw = f"{user}\x00{scope}\x00{key}".encode("utf-8")
+    raw = f"{user}\x00{scope}\x00{key}".encode()
     return hashlib.sha256(raw).hexdigest()
 
 

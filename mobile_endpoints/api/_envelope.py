@@ -86,8 +86,20 @@ def fail(code: str, message: str, fields: dict | None = None, http_status: int =
     return env
 
 
-def _first_message(exc: Exception) -> str:
-    for entry in (frappe.local.message_log or []):
+def _first_message(exc: Exception, start_at: int = 0) -> str:
+    """Return a validation message emitted by the current handler call.
+
+    ``frappe.local.message_log`` normally lives for one HTTP request, but API
+    handlers are also called directly by tests, console jobs and other Python
+    code.  In those cases the list can contain messages from an earlier call.
+    Reading the first entry therefore reports the wrong failure and can leak
+    unrelated validation text into the response.  ``mobile_api`` snapshots the
+    list length before invoking the handler and only considers newer entries.
+    """
+    entries = list(getattr(frappe.local, "message_log", None) or [])
+    if start_at > 0:
+        entries = entries[start_at:]
+    for entry in reversed(entries):
         try:
             text = entry.get("message") if isinstance(entry, dict) else str(entry)
         except Exception:
@@ -114,6 +126,8 @@ def mobile_api(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         from mobile_endpoints.api._idempotency import IdempotencyConflict
+
+        message_log_start = len(getattr(frappe.local, "message_log", None) or [])
 
         try:
             result = fn(*args, **kwargs)
@@ -148,7 +162,7 @@ def mobile_api(fn):
             return fail(ERR_IDEMPOTENCY_CONFLICT, str(exc), http_status=409)
         except frappe.ValidationError as exc:
             frappe.db.rollback()
-            return fail(ERR_VALIDATION, _first_message(exc), http_status=422)
+            return fail(ERR_VALIDATION, _first_message(exc, message_log_start), http_status=422)
         except Exception:
             frappe.db.rollback()
             frappe.log_error(frappe.get_traceback(), f"mobile_api:{getattr(fn, '__name__', 'handler')}")

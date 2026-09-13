@@ -34,7 +34,7 @@ class AuthenticationError(Exception):
 	http_status_code = 401
 
 
-class PermissionError(Exception):  # noqa: A001 - mirrors frappe.PermissionError
+class PermissionError(Exception):
 	http_status_code = 403
 
 
@@ -106,8 +106,16 @@ if "frappe" not in sys.modules:
 	sys.modules["erpnext"] = erpnext_stub
 
 
-from mobile_endpoints.api import _envelope, _idempotency, invoice, operation, payment, security, user, utils  # noqa: E402
-
+from mobile_endpoints.api import (
+	_envelope,
+	_idempotency,
+	invoice,
+	operation,
+	payment,
+	security,
+	user,
+	utils,
+)
 
 # --------------------------------------------------------------------------- #
 #  helpers                                                                    #
@@ -162,6 +170,7 @@ def fake_frappe(*, user_name="user@example.com", config=None, request=None):
 	runtime.generate_hash = lambda length=10: "0" * int(length or 10)
 	runtime.get_traceback = lambda: "traceback"
 	runtime.log_error = lambda *a, **k: None
+	runtime.utils = SimpleNamespace(strip_html_tags=lambda value: value)
 	runtime.defaults = SimpleNamespace(
 		get_user_default=lambda key: "",
 		get_global_default=lambda key: "",
@@ -580,6 +589,35 @@ def test_mobile_api_maps_stale_document_error_to_409_with_current_state(monkeypa
 	assert out["error"]["code"] == "conflict"
 	assert out["data"] == {"id": "INV-1", "modified": "t2"}
 	assert runtime.local.response.get("http_status_code") == 409
+
+
+def test_mobile_api_ignores_stale_validation_messages(monkeypatch):
+	runtime = fake_frappe()
+	runtime.local.message_log = [{"message": "stale failure from an earlier direct call"}]
+	_patch(monkeypatch, _envelope, runtime)
+
+	@_envelope.mobile_api
+	def _handler():
+		runtime.local.message_log.append({"message": "current validation failure"})
+		raise runtime.ValidationError("fallback exception text")
+
+	out = _handler()
+	assert out["success"] is False
+	assert out["error"]["message"] == "current validation failure"
+	assert "stale failure" not in json.dumps(out)
+
+
+def test_mobile_api_falls_back_to_exception_when_only_stale_messages_exist(monkeypatch):
+	runtime = fake_frappe()
+	runtime.local.message_log = [{"message": "stale failure from an earlier direct call"}]
+	_patch(monkeypatch, _envelope, runtime)
+
+	@_envelope.mobile_api
+	def _handler():
+		raise runtime.ValidationError("current exception text")
+
+	out = _handler()
+	assert out["error"]["message"] == "current exception text"
 
 
 # --------------------------------------------------------------------------- #
