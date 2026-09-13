@@ -86,6 +86,8 @@ def _normalized_item(item: dict) -> dict:
 	price = flt(item.get("price"))
 	if not item_code:
 		frappe.throw(_("Every invoice row requires an item"), frappe.ValidationError)
+	if not customer:
+		frappe.throw(_("Every invoice row requires a customer"), frappe.ValidationError)
 	if qty <= 0:
 		frappe.throw(
 			_("Quantity must be greater than zero for item {0}").format(item_code), frappe.ValidationError
@@ -93,8 +95,7 @@ def _normalized_item(item: dict) -> dict:
 	if price < 0:
 		frappe.throw(_("Price must not be negative for item {0}").format(item_code), frappe.ValidationError)
 	_require_link_access("Item", item_code)
-	if customer:
-		_require_link_access("Customer", customer)
+	_require_link_access("Customer", customer)
 	return {
 		"item_code": item_code,
 		"item_name": cstr(frappe.db.get_value("Item", item_code, "item_name") or item_code),

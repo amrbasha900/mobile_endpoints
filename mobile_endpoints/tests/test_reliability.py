@@ -351,7 +351,15 @@ class ReliabilityTestCase(FrappeTestCase):
 		body = {
 			"posting_date": frappe.utils.today(),
 			"supplier": self.supplier,
-			"items": [{"item_code": self.item_code, "qty": qty, "price": price}],
+			"customer": self.customer,
+			"items": [
+				{
+					"item_code": self.item_code,
+					"customer": self.customer,
+					"qty": qty,
+					"price": price,
+				}
+			],
 		}
 		if client_request_id is not None:
 			body["client_request_id"] = client_request_id
@@ -368,7 +376,13 @@ class ReliabilityTestCase(FrappeTestCase):
 		return _expect_success(self.create_invoice(client_request_id, **kw), "create_invoice_form")
 
 	def update_invoice(self, name: str, items: list[dict], base_modified: str, client_request_id=None) -> dict:
-		data = {"items": items}
+		# Customer is mandatory on this deployment's Invoice Form child row.
+		# Mirror the production client, which sends the selected customer per row.
+		normalized_items = [
+			{**item, "customer": item.get("customer") or self.customer}
+			for item in items
+		]
+		data = {"items": normalized_items}
 		full_body = {"name": name, "data": data, "base_modified": base_modified}
 		if client_request_id is not None:
 			full_body["client_request_id"] = client_request_id

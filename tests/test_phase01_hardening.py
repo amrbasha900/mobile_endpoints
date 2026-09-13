@@ -193,6 +193,17 @@ def test_invoice_total_ignores_client_supplied_total(monkeypatch):
 	assert row["total"] == 21
 
 
+def test_invoice_row_requires_customer_before_document_insert(monkeypatch):
+	runtime = fake_frappe()
+	monkeypatch.setattr(invoice, "frappe", runtime)
+	monkeypatch.setattr(invoice, "cstr", lambda value: "" if value is None else str(value))
+	monkeypatch.setattr(invoice, "flt", lambda value: float(value or 0))
+	monkeypatch.setattr(invoice, "require_doctype_permission", lambda *args, **kwargs: None)
+
+	with pytest.raises(ValidationError, match="requires a customer"):
+		invoice._normalized_item({"item_code": "ITEM-1", "qty": 1, "price": 7})
+
+
 def test_payment_uses_server_party_name_and_canonical_type(monkeypatch):
 	runtime = fake_frappe()
 	document = FakeDocument()
