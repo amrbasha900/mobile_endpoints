@@ -691,7 +691,11 @@ class TestInvoicePeriodAndSummary(ReliabilityTestCase):
 			self._get_invoices(from_date=today_str, to_date=today_str, page=2, page_size=1), "get_invoices p2"
 		)
 		self.assertEqual(page1["summary"], page2["summary"])
-		self.assertGreaterEqual(page1["summary"]["draft"], 3)
+		# create_invoice_ok() always leaves a real invoice at docstatus=0 with
+		# workflow status "Pending" -- the "pending" bucket, not "draft" (which
+		# no create-API path can reach; see test_blank_status_invoice_is_
+		# counted_as_draft_not_pending for dedicated draft-bucket coverage).
+		self.assertGreaterEqual(page1["summary"]["pending"], 3)
 
 	def test_search_and_supplier_filters_affect_rows_and_summary_consistently(self):
 		today_str = frappe.utils.today()
@@ -704,12 +708,12 @@ class TestInvoicePeriodAndSummary(ReliabilityTestCase):
 			self._get_invoices(from_date=today_str, to_date=today_str, supplier=self.supplier, page_size=1),
 			"get_invoices (after)",
 		)
-		self.assertEqual(after["summary"]["draft"], before["summary"]["draft"] + 1)
+		self.assertEqual(after["summary"]["pending"], before["summary"]["pending"] + 1)
 		self.assertEqual(after["summary"]["total"], before["summary"]["total"] + 1)
 
 	def test_selected_status_filter_does_not_hide_the_other_status_cards(self):
 		today_str = frappe.utils.today()
-		self.create_invoice_ok(str(uuid.uuid4()))
+		self.create_invoice_ok(str(uuid.uuid4()))  # left Pending
 		submitted_name = self.create_invoice_ok(str(uuid.uuid4()))["name"]
 		self.submit_invoice(submitted_name, client_request_id=str(uuid.uuid4()))
 
@@ -718,9 +722,30 @@ class TestInvoicePeriodAndSummary(ReliabilityTestCase):
 			"get_invoices (status=submitted)",
 		)
 		# Even while filtering rows to "submitted", the summary must still
-		# report the (non-zero) draft count -- not just the active tab's.
+		# report the (non-zero) pending count -- not just the active tab's.
 		self.assertGreaterEqual(resp["summary"]["submitted"], 1)
-		self.assertGreaterEqual(resp["summary"]["draft"], 1)
+		self.assertGreaterEqual(resp["summary"]["pending"], 1)
+
+	def test_blank_status_invoice_is_counted_as_draft_not_pending(self):
+		"""No create-API path leaves an invoice with a blank workflow status --
+		create_invoice_form() always sets it to "Pending" -- so the "draft"
+		bucket (docstatus=0 with a blank/non-"Pending" status) can only be
+		exercised here via a test-only DB update, never by redefining a normal
+		Pending invoice as Draft."""
+		today_str = frappe.utils.today()
+		before = _expect_success(
+			self._get_invoices(from_date=today_str, to_date=today_str, page_size=1), "get_invoices (before)"
+		)
+		name = self.create_invoice_ok(str(uuid.uuid4()))["name"]
+		frappe.db.set_value("Invoice Form", name, "status", "")
+		frappe.db.commit()
+
+		after = _expect_success(
+			self._get_invoices(from_date=today_str, to_date=today_str, page_size=1), "get_invoices (after)"
+		)
+		self.assertEqual(after["summary"]["draft"], before["summary"]["draft"] + 1)
+		self.assertEqual(after["summary"]["pending"], before["summary"]["pending"])
+		self.assertEqual(after["summary"]["total"], before["summary"]["total"] + 1)
 
 	def test_cross_user_gets_no_rows_no_counts_not_a_403_disguised_as_zero(self):
 		"""A user with zero document permission on Invoice Form must be
@@ -806,6 +831,14 @@ class TestPaymentCompany(ReliabilityTestCase):
 			self.track_log("payment.create", body["client_request_id"])
 		return resp
 
+	@staticmethod
+	def _force_status(name: str, status: str) -> None:
+		"""Test-only: directly set a workflow status the create API itself
+		has no way to reach (it never accepts a client-supplied status).
+		Shared by TestPaymentPeriodAndSummary and TestPaymentFilters."""
+		frappe.db.set_value("Collection and Payment", name, "status", status)
+		frappe.db.commit()
+
 	def test_missing_company_resolves_the_user_default(self):
 		# NB: the resolver reads the lowercase "company" default key
 		# (`frappe.defaults.get_user_default("company")`, matching the DocType
@@ -860,13 +893,6 @@ class TestPaymentPeriodAndSummary(TestPaymentCompany):
 	def _get_payments(self, **kw):
 		_set_get_request()
 		return payment_api.list_collection_payments(**kw)
-
-	@staticmethod
-	def _force_status(name: str, status: str) -> None:
-		"""Test-only: directly set a workflow status the create API itself
-		has no way to reach (it never accepts a client-supplied status)."""
-		frappe.db.set_value("Collection and Payment", name, "status", status)
-		frappe.db.commit()
 
 	def test_default_period_is_today_in_the_site_timezone(self):
 		resp = _expect_success(self._get_payments(page_size=1), "list_collection_payments")
@@ -962,17 +988,26 @@ class TestPaymentFilters(TestPaymentCompany):
 		return _expect_success(self._create_payment(body), "create_collection_payment")
 
 	def test_search_changes_rows_and_summary_consistently(self):
+		# party_name is always resolved server-side from the selected party
+		# (create_collection_payment ignores whatever the client sends for
+		# it) -- so search on the canonical value it actually persisted,
+		# not a client-supplied one that production correctly discards.
 		today_str = frappe.utils.today()
-		distinct_party_name = f"{TEST_PREFIX}-SEARCH-TARGET-{uuid.uuid4().hex[:8]}"
-		matching = self._create_payment_as_admin(party_name=distinct_party_name)
-		self._create_payment_as_admin()  # a second, non-matching payment
+		matching = self._create_payment_as_admin(party_type="Customer", party=self.customer)
+		non_matching = self._create_payment_as_admin(party_type="Supplier", party=self.supplier)
+
+		search_term = frappe.db.get_value(
+			"Collection and Payment Details", {"parent": matching["name"]}, "party_name"
+		)
+		self.assertTrue(search_term, "the created payment must have a persisted party_name to search on")
 
 		resp = _expect_success(
-			self._get_payments(from_date=today_str, to_date=today_str, search=distinct_party_name, page_size=10),
+			self._get_payments(from_date=today_str, to_date=today_str, search=search_term, page_size=10),
 			"list_collection_payments (search)",
 		)
 		names = [row["name"] for row in resp["payments"]]
 		self.assertIn(matching["name"], names)
+		self.assertNotIn(non_matching["name"], names)
 		self.assertEqual(resp["summary"]["total"], len(names), "summary must match the searched, not the full, set")
 
 	def test_party_type_and_party_change_rows_and_summary_consistently(self):
