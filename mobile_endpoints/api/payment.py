@@ -4,7 +4,8 @@ import frappe
 from frappe import _
 from frappe.utils import cint, cstr, flt
 
-from mobile_endpoints.api._envelope import mobile_api
+from mobile_endpoints.api._dates import resolve_period, site_timezone
+from mobile_endpoints.api._envelope import mobile_api, ok
 from mobile_endpoints.api._idempotency import lookup as _idem_lookup
 from mobile_endpoints.api._idempotency import run_idempotent
 from mobile_endpoints.api.security import (
@@ -193,12 +194,36 @@ def get_payment_by_request_id(client_request_id: str | None = None):
 # --- API: list -------------------------------------------------------------
 
 
+def _normalize_payment_status(value) -> str:
+	"""Mirrors the deployed client's own TransactionsPage normalizeStatus():
+	Approved/Paid -> approved, Rejected -> rejected, everything else
+	(including blank/unset) -> pending. Not inventing a new vocabulary --
+	just moving the existing client-side classification onto the server so
+	the summary agrees with what a user already sees on screen."""
+	normalized = cstr(value).strip().lower()
+	if normalized in {"approved", "paid"}:
+		return "approved"
+	if normalized == "rejected":
+		return "rejected"
+	return "pending"
+
+
 @frappe.whitelist(allow_guest=True, methods=["GET"])
 @mobile_api
-def list_collection_payments(page: int = 1, page_size: int = 20):
+def list_collection_payments(
+	page: int = 1,
+	page_size: int = 20,
+	start_date: str | None = None,
+	end_date: str | None = None,
+	from_date: str | None = None,
+	to_date: str | None = None,
+	company: str | None = None,
+):
 	"""
-	GET /api/method/mobile_endpoints.api.payment.list_collection_payments?page=1&page_size=20
+	GET /api/method/mobile_endpoints.api.payment.list_collection_payments
 	Returns only documents where pamper_collection_and_payment = 1.
+	`from_date`/`to_date` are canonical (`start_date`/`end_date` kept as
+	aliases); neither given -> defaults to "today" in the site timezone.
 	"""
 	set_cors_headers("GET, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
@@ -211,36 +236,51 @@ def list_collection_payments(page: int = 1, page_size: int = 20):
 	page_size = min(100, max(1, cint(page_size)))
 	start = (page - 1) * page_size
 
+	resolved_from, resolved_to = resolve_period(from_date or start_date, to_date or end_date)
+
+	# Shared by rows AND the summary below (BR-06 style: only non-status
+	# filters are shared, so a status card never hides the others).
+	base_filters = [
+		["pamper_collection_and_payment", "=", 1],
+		["posting_date", ">=", resolved_from],
+		["posting_date", "<=", resolved_to],
+	]
+	if company:
+		base_filters.append(["company", "=", cstr(company)])
+
+	meta = frappe.get_meta("Collection and Payment")
+	has_currency_field = meta.has_field("currency")
+
 	parents = frappe.get_list(
 		"Collection and Payment",
-		filters={"pamper_collection_and_payment": 1},
+		filters=base_filters,
 		fields=["name", "posting_date", "company", "owner", "creation", "status"],
 		order_by="creation desc",
 		limit_start=start,
 		limit_page_length=page_size + 1,
 	)
 
-	if not parents:
-		return {"payments": [], "has_more": False}
-
 	has_more = len(parents) > page_size
 	parents = parents[:page_size]
 	parent_names = [p["name"] for p in parents]
-	child_rows = frappe.get_all(
-		"Collection and Payment Details",
-		filters={"parent": ("in", parent_names)},
-		fields=[
-			"parent",
-			"payment_type",
-			"party_type",
-			"party",
-			"party_name",
-			"amount",
-			"mode_of_payment",
-			"description",
-		],
-		order_by="idx asc",
-	)
+
+	child_rows = []
+	if parent_names:
+		child_rows = frappe.get_all(
+			"Collection and Payment Details",
+			filters={"parent": ("in", parent_names)},
+			fields=[
+				"parent",
+				"payment_type",
+				"party_type",
+				"party",
+				"party_name",
+				"amount",
+				"mode_of_payment",
+				"description",
+			],
+			order_by="idx asc",
+		)
 
 	first_row_map: dict[str, dict[str, Any]] = {}
 	for row in child_rows:
@@ -267,7 +307,94 @@ def list_collection_payments(page: int = 1, page_size: int = 20):
 			}
 		)
 
-	return {"payments": results, "has_more": has_more}
+	# --- summary -------------------------------------------------------
+	# Every authorized record in the SAME date/company window as the rows
+	# above -- the whole filtered set, not just this page. Cancelled
+	# (docstatus=2) parents are excluded entirely (never counted, never
+	# included in financial totals). Permission-aware throughout:
+	# frappe.get_list for the parent scope, never get_all/ignore_permissions;
+	# the one frappe.get_all below is scoped to that already-vetted parent
+	# set (child table rows carry no permissions of their own in Frappe).
+	summary_fields = ["name", "status", "docstatus"]
+	if has_currency_field:
+		summary_fields.append("currency")
+	summary_parents = frappe.get_list(
+		"Collection and Payment",
+		filters=base_filters + [["docstatus", "!=", 2]],
+		fields=summary_fields,
+		limit_page_length=0,
+	)
+
+	total_count = len(summary_parents)
+	approved_count = 0
+	rejected_count = 0
+	approved_names: list[str] = []
+	currency_by_name: dict[str, str] = {}
+	for p in summary_parents:
+		bucket = _normalize_payment_status(p.get("status"))
+		if bucket == "approved":
+			approved_count += 1
+			approved_names.append(p["name"])
+			if has_currency_field:
+				currency_by_name[p["name"]] = cstr(p.get("currency")) or "default"
+		elif bucket == "rejected":
+			rejected_count += 1
+	pending_count = total_count - approved_count - rejected_count
+
+	# Financial totals: approved transactions only, decimal-safe (flt at
+	# currency precision), grouped by currency if this doctype tracks one --
+	# never silently summed across mismatched currencies.
+	totals_by_currency: dict[str, dict[str, float]] = {}
+	if approved_names:
+		summary_child_rows = frappe.get_all(
+			"Collection and Payment Details",
+			filters={"parent": ("in", approved_names)},
+			fields=["parent", "payment_type", "amount"],
+		)
+		for row in summary_child_rows:
+			currency_key = currency_by_name.get(row["parent"], "default") if has_currency_field else "default"
+			bucket = totals_by_currency.setdefault(currency_key, {"inflow": 0.0, "outflow": 0.0})
+			amount = flt(row.get("amount", 0), 2)
+			payment_type = cstr(row.get("payment_type", "")).strip().lower()
+			if payment_type == "pay":
+				bucket["outflow"] = flt(bucket["outflow"] + amount, 2)
+			elif payment_type == "receive":
+				bucket["inflow"] = flt(bucket["inflow"] + amount, 2)
+
+	by_currency = {
+		currency: {
+			"inflow": vals["inflow"],
+			"outflow": vals["outflow"],
+			"net": flt(vals["inflow"] - vals["outflow"], 2),
+		}
+		for currency, vals in totals_by_currency.items()
+	}
+	if len(by_currency) <= 1:
+		only = next(iter(by_currency.values()), {"inflow": 0.0, "outflow": 0.0, "net": 0.0})
+		totals = {**only, "basis": "approved"}
+	else:
+		# Multiple currencies among the authorized, approved results -- a
+		# single combined figure would be misleading. The client must show
+		# `totals_by_currency` separately or require a currency filter.
+		totals = {"basis": "approved", "mixed_currencies": True}
+
+	summary = {
+		"total": total_count,
+		"approved": approved_count,
+		"pending": pending_count,
+		"rejected": rejected_count,
+		"totals": totals,
+	}
+	if has_currency_field:
+		summary["totals_by_currency"] = by_currency
+
+	data = {
+		"payments": results,
+		"has_more": has_more,
+		"summary": summary,
+		"period": {"from_date": resolved_from, "to_date": resolved_to, "timezone": site_timezone()},
+	}
+	return ok(data, meta={"total_count": total_count})
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])

@@ -61,11 +61,11 @@ def _set_status(http_status: int) -> None:
         pass
 
 
-def ok(data=None, http_status: int = 200):
+def ok(data=None, http_status: int = 200, meta: dict | None = None):
     payload = {
         "success": True,
         "data": data if data is not None else {},
-        "meta": {"request_id": request_id()},
+        "meta": {"request_id": request_id(), **(meta or {})},
     }
     if isinstance(data, dict):
         for key, value in data.items():

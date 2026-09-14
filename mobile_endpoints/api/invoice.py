@@ -5,7 +5,8 @@ from frappe import _
 from frappe.utils import cint, cstr, flt, get_url, now_datetime, nowtime
 from frappe.utils.file_manager import save_file
 
-from mobile_endpoints.api._envelope import StaleDocumentError, mobile_api
+from mobile_endpoints.api._dates import resolve_period, site_timezone
+from mobile_endpoints.api._envelope import StaleDocumentError, mobile_api, ok
 from mobile_endpoints.api._idempotency import lookup as _idem_lookup
 from mobile_endpoints.api._idempotency import run_idempotent
 from mobile_endpoints.api.security import (
@@ -216,12 +217,17 @@ def get_invoice_references(limit: int | str = 200):
 def get_invoices(
 	start_date: str | None = None,
 	end_date: str | None = None,
+	from_date: str | None = None,
+	to_date: str | None = None,
 	supplier: str | None = None,
 	status: str | None = None,
 	page: int | str = 1,
 	page_size: int | str = 20,
 	search: str | None = None,
 ):
+	"""`from_date`/`to_date` are canonical; `start_date`/`end_date` are kept
+	as aliases for backward compatibility with existing callers. Neither
+	given -> defaults to "today" in the site timezone (see resolve_period)."""
 	set_cors_headers("GET, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
 		return {}
@@ -235,26 +241,31 @@ def get_invoices(
 	page_size = max(1, min(100, cint(page_size)))
 	start = (page - 1) * page_size
 
-	filters = []
-	if start_date:
-		filters.append(["posting_date", ">=", cstr(start_date)])
-	if end_date:
-		filters.append(["posting_date", "<=", cstr(end_date)])
+	resolved_from, resolved_to = resolve_period(from_date or start_date, to_date or end_date)
+
+	# Filters shared by rows AND the summary (date range + search + supplier)
+	# -- everything EXCEPT the currently-selected status, so the summary can
+	# ignore just that one (see the summary block below).
+	base_filters = [
+		["posting_date", ">=", resolved_from],
+		["posting_date", "<=", resolved_to],
+	]
 	if supplier:
-		filters.append(["supplier", "=", cstr(supplier)])
+		base_filters.append(["supplier", "=", cstr(supplier)])
 
 	meta = frappe.get_meta(DOCTYPE)
+	pending_field = "status" if meta.has_field("status") else ("workflow_state" if meta.has_field("workflow_state") else None)
 
+	filters = list(base_filters)
 	if status:
 		normalized = cstr(status).strip().lower()
 		status_map = {"draft": 0, "submitted": 1, "cancelled": 2}
 		if normalized in status_map:
 			filters.append(["docstatus", "=", status_map[normalized]])
 		elif normalized == "pending":
-			if meta.has_field("status"):
-				filters.append(["status", "=", "Pending"])
-			elif meta.has_field("workflow_state"):
-				filters.append(["workflow_state", "=", "Pending"])
+			if pending_field:
+				filters.append(["docstatus", "=", 0])
+				filters.append([pending_field, "=", "Pending"])
 			else:
 				filters.append(["docstatus", "=", 0])
 		else:
@@ -323,13 +334,51 @@ def get_invoices(
 		})
 
 	has_more = (start + len(invoices)) < total_count
-	return {
+
+	# --- summary -----------------------------------------------------------
+	# Every authorized record matching the SAME date/search/supplier filters
+	# as the rows above -- the whole filtered set, not just this page -- but
+	# ignoring only the currently-selected status filter (base_filters, not
+	# filters), so every status card stays accurate no matter which tab is
+	# active. Permission-aware: frappe.get_list, never get_all/ignore_permissions.
+	def _bucket_count(extra_filters):
+		bucket_rows = frappe.get_list(
+			DOCTYPE, fields=["count(name) as c"],
+			filters=base_filters + extra_filters, or_filters=or_filters,
+			limit_page_length=1,
+		)
+		return cint(bucket_rows[0].c) if bucket_rows else 0
+
+	submitted_count = _bucket_count([["docstatus", "=", 1]])
+	cancelled_count = _bucket_count([["docstatus", "=", 2]])
+	draft_and_pending_count = _bucket_count([["docstatus", "=", 0]])
+	if pending_field:
+		# Subtraction (not a `!= 'Pending'` filter) so rows with a NULL/blank
+		# status field -- SQL `!=` never matches NULL -- are still counted as
+		# drafts instead of silently disappearing from both buckets.
+		pending_count = _bucket_count([["docstatus", "=", 0], [pending_field, "=", "Pending"]])
+	else:
+		pending_count = 0
+	draft_count = draft_and_pending_count - pending_count
+
+	summary = {
+		"total": submitted_count + cancelled_count + draft_count + pending_count,
+		"submitted": submitted_count,
+		"draft": draft_count,
+		"pending": pending_count,
+		"cancelled": cancelled_count,
+	}
+
+	data = {
 		"invoices": invoices,
 		"page": page,
 		"page_size": page_size,
 		"total_count": total_count,
 		"has_more": has_more,
+		"summary": summary,
+		"period": {"from_date": resolved_from, "to_date": resolved_to, "timezone": site_timezone()},
 	}
+	return ok(data, meta={"total_count": total_count})
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])

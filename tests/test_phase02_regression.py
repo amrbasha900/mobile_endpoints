@@ -21,6 +21,7 @@ and is exercised separately with ``bench run-tests``.
 
 from __future__ import annotations
 
+import datetime
 import inspect
 import json
 import sys
@@ -80,13 +81,19 @@ if "frappe" not in sys.modules:
 	frappe_utils = types.ModuleType("frappe.utils")
 	frappe_utils.cint = lambda value: int(value or 0)
 	frappe_utils.cstr = lambda value: "" if value is None else str(value)
-	frappe_utils.flt = lambda value: float(value or 0)
+	frappe_utils.flt = lambda value, precision=None: (
+		round(float(value or 0), precision) if precision is not None else float(value or 0)
+	)
 	frappe_utils.get_url = lambda: "https://erp.example.com"
 	frappe_utils.now_datetime = lambda: None
 	frappe_utils.nowtime = lambda: "00:00:00"
 	frappe_utils.today = lambda: "2026-09-09"
 	frappe_utils.add_days = lambda dt, days: dt
 	frappe_utils.strip_html_tags = lambda value: value
+	frappe_utils.getdate = lambda v: (
+		v if isinstance(v, datetime.date) else datetime.datetime.strptime(str(v), "%Y-%m-%d").date()
+	)
+	frappe_utils.get_system_timezone = lambda: "Asia/Riyadh"
 	frappe_stub.utils = frappe_utils
 
 	file_manager = types.ModuleType("frappe.utils.file_manager")
@@ -107,6 +114,7 @@ if "frappe" not in sys.modules:
 
 
 from mobile_endpoints.api import (
+	_dates,
 	_envelope,
 	_idempotency,
 	invoice,
@@ -170,7 +178,11 @@ def fake_frappe(*, user_name="user@example.com", config=None, request=None):
 	runtime.generate_hash = lambda length=10: "0" * int(length or 10)
 	runtime.get_traceback = lambda: "traceback"
 	runtime.log_error = lambda *a, **k: None
-	runtime.utils = SimpleNamespace(strip_html_tags=lambda value: value)
+	runtime.utils = SimpleNamespace(
+		strip_html_tags=lambda value: value,
+		today=lambda: "2026-09-09",
+		get_system_timezone=lambda: "Asia/Riyadh",
+	)
 	runtime.defaults = SimpleNamespace(
 		get_user_default=lambda key: "",
 		get_global_default=lambda key: "",
@@ -748,4 +760,286 @@ def test_every_public_endpoint_has_a_recorded_envelope_decision():
 		stale = expected - actual
 		assert not stale, (
 			f"{module.__name__}: recorded endpoint(s) no longer exist: {sorted(stale)}"
+		)
+
+
+# --------------------------------------------------------------------------- #
+#  date-range resolution (_dates.py) -- Phase 02 increment 4                  #
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_period_defaults_to_today_when_no_dates_given():
+	assert _dates.resolve_period(None, None) == ("2026-09-09", "2026-09-09")  # the stub's fixed "today"
+
+
+def test_resolve_period_accepts_an_explicit_range():
+	assert _dates.resolve_period("2026-01-01", "2026-01-31") == ("2026-01-01", "2026-01-31")
+
+
+def test_resolve_period_yesterday_and_presets_are_just_explicit_dates():
+	# "Yesterday" / "Last 7 days" / "Last 30 days" are frontend presets that
+	# resolve to explicit from_date/to_date -- the backend only ever validates
+	# whatever range it's given.
+	assert _dates.resolve_period("2026-09-08", "2026-09-08") == ("2026-09-08", "2026-09-08")
+	assert _dates.resolve_period("2026-09-02", "2026-09-09") == ("2026-09-02", "2026-09-09")
+	assert _dates.resolve_period("2026-08-10", "2026-09-09") == ("2026-08-10", "2026-09-09")
+
+
+def test_resolve_period_rejects_an_invalid_iso_date():
+	with pytest.raises(_dates.DateRangeError, match="Invalid"):
+		_dates.resolve_period("not-a-date", "2026-01-31")
+
+
+def test_resolve_period_rejects_a_reversed_range():
+	with pytest.raises(_dates.DateRangeError, match="from_date must not be after to_date"):
+		_dates.resolve_period("2026-02-01", "2026-01-01")
+
+
+def test_resolve_period_rejects_a_range_wider_than_the_limit():
+	with pytest.raises(_dates.DateRangeError, match="too wide"):
+		_dates.resolve_period("2024-01-01", "2026-01-01")  # ~2 years > MAX_RANGE_DAYS
+
+
+def test_resolve_period_accepts_a_range_exactly_at_the_limit():
+	# MAX_RANGE_DAYS=366 -- a leap-year-safe full year must still pass.
+	from_date, to_date = _dates.resolve_period("2025-01-01", "2026-01-01")
+	assert (from_date, to_date) == ("2025-01-01", "2026-01-01")
+
+
+def test_dates_error_is_a_validation_error_so_mobile_api_maps_it_to_422(monkeypatch):
+	runtime = fake_frappe()
+	# DateRangeError subclasses whatever frappe.ValidationError _dates.py itself
+	# resolved at import time (bound once, from whichever module stub loaded
+	# first -- this test file's or test_phase01_hardening.py's). Reuse that
+	# exact class here so mobile_api's `except frappe.ValidationError` check
+	# actually matches it, regardless of collection order.
+	runtime.ValidationError = _dates.frappe.ValidationError
+	_patch(monkeypatch, _envelope, runtime)
+
+	@_envelope.mobile_api
+	def _handler():
+		_dates.resolve_period("2026-02-01", "2026-01-01")
+
+	out = _handler()
+	assert out["success"] is False
+	assert out["error"]["code"] == "validation_error"
+	assert runtime.local.response.get("http_status_code") == 422
+
+
+# --------------------------------------------------------------------------- #
+#  payment status normalization (payment.py) -- mirrors the deployed client  #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+	"raw, expected",
+	[
+		("Approved", "approved"),
+		("Paid", "approved"),
+		("approved", "approved"),
+		("Rejected", "rejected"),
+		("rejected", "rejected"),
+		("Pending", "pending"),
+		("", "pending"),
+		(None, "pending"),
+		("Draft", "pending"),
+	],
+)
+def test_normalize_payment_status_matches_the_frontends_own_classification(raw, expected):
+	assert payment._normalize_payment_status(raw) == expected
+
+
+# --------------------------------------------------------------------------- #
+#  get_invoices summary -- mutually-exclusive buckets, ignores active status  #
+# --------------------------------------------------------------------------- #
+
+
+def test_get_invoices_summary_buckets_ignore_the_active_status_filter(monkeypatch):
+	runtime = fake_frappe()
+	runtime.local.request = SimpleNamespace(method="GET", headers={})
+	runtime.has_permission = lambda **k: True
+
+	class FakeMeta:
+		def has_field(self, name):
+			return name == "status"
+
+	runtime.get_meta = lambda dt: FakeMeta()
+
+	def fake_get_list(doctype, **kwargs):
+		fields = kwargs.get("fields") or []
+		filters = kwargs.get("filters") or []
+		if fields and fields[0] == "count(name) as total_count":
+			return [SimpleNamespace(total_count=0)]
+		if fields and fields[0] == "count(name) as c":
+			if ["docstatus", "=", 1] in filters:
+				return [SimpleNamespace(c=3)]
+			if ["docstatus", "=", 2] in filters:
+				return [SimpleNamespace(c=1)]
+			if ["docstatus", "=", 0] in filters and ["status", "=", "Pending"] in filters:
+				return [SimpleNamespace(c=2)]
+			if ["docstatus", "=", 0] in filters:
+				return [SimpleNamespace(c=7)]  # draft+pending combined (2 of these are pending)
+			return [SimpleNamespace(c=0)]
+		return []  # the actual rows query -- not under test here
+
+	runtime.get_list = fake_get_list
+	_patch(monkeypatch, invoice, runtime)
+	_patch(monkeypatch, security, runtime)
+	_patch(monkeypatch, _dates, runtime)
+	monkeypatch.setattr(invoice, "set_cors_headers", lambda methods: None)
+	monkeypatch.setattr(invoice, "require_authenticated_user", lambda: "user@example.com")
+
+	# The caller is currently viewing the "draft" tab -- the summary must
+	# still report accurate counts for every OTHER status too.
+	resp = invoice.get_invoices(status="draft", from_date="2026-01-01", to_date="2026-01-31")
+	data = resp["data"]
+
+	assert data["summary"] == {
+		"total": 3 + 1 + 5 + 2,
+		"submitted": 3,
+		"draft": 5,  # 7 (docstatus=0) minus the 2 that are actually pending
+		"pending": 2,
+		"cancelled": 1,
+	}
+	assert data["period"] == {"from_date": "2026-01-01", "to_date": "2026-01-31", "timezone": "Asia/Riyadh"}
+
+
+# --------------------------------------------------------------------------- #
+#  list_collection_payments summary -- approved-only totals, currency-safe   #
+# --------------------------------------------------------------------------- #
+
+
+def test_list_collection_payments_summary_is_approved_only_and_currency_grouped(monkeypatch):
+	runtime = fake_frappe()
+	runtime.local.request = SimpleNamespace(method="GET", headers={})
+
+	class FakeMeta:
+		def has_field(self, name):
+			return name == "currency"
+
+	runtime.get_meta = lambda dt: FakeMeta()
+
+	summary_parents = [
+		{"name": "CP-1", "status": "Approved", "docstatus": 1, "currency": "SAR"},
+		{"name": "CP-2", "status": "Paid", "docstatus": 1, "currency": "USD"},
+		{"name": "CP-3", "status": "Pending", "docstatus": 0, "currency": "SAR"},
+		{"name": "CP-4", "status": "Rejected", "docstatus": 1, "currency": "SAR"},
+	]
+	child_rows_by_parent = {
+		"CP-1": [{"parent": "CP-1", "payment_type": "Receive", "amount": 100}],
+		"CP-2": [{"parent": "CP-2", "payment_type": "Pay", "amount": 40}],
+	}
+
+	def fake_get_list(doctype, **kwargs):
+		fields = kwargs.get("fields") or []
+		if "status" in fields and "docstatus" in fields:
+			return list(summary_parents)
+		return []  # the paginated rows query -- not under test here
+
+	def fake_get_all(doctype, **kwargs):
+		filters = kwargs.get("filters") or {}
+		parent_in = filters.get("parent", (None, []))[1]
+		rows = [r for name in parent_in for r in child_rows_by_parent.get(name, [])]
+		return rows
+
+	runtime.get_list = fake_get_list
+	runtime.get_all = fake_get_all
+	_patch(monkeypatch, payment, runtime)
+	_patch(monkeypatch, security, runtime)
+	_patch(monkeypatch, _dates, runtime)
+	monkeypatch.setattr(payment, "set_cors_headers", lambda methods: None)
+	monkeypatch.setattr(payment, "require_authenticated_user", lambda: "user@example.com")
+	monkeypatch.setattr(payment, "require_doctype_permission", lambda *a, **k: None)
+
+	resp = payment.list_collection_payments(from_date="2026-01-01", to_date="2026-01-01")
+	data = resp["data"]
+
+	assert data["summary"]["total"] == 4
+	assert data["summary"]["approved"] == 2
+	assert data["summary"]["rejected"] == 1
+	assert data["summary"]["pending"] == 1
+	# Two different currencies among the approved results -- must never be
+	# silently combined into one misleading figure.
+	assert data["summary"]["totals"] == {"basis": "approved", "mixed_currencies": True}
+	assert data["summary"]["totals_by_currency"] == {
+		"SAR": {"inflow": 100.0, "outflow": 0.0, "net": 100.0},
+		"USD": {"inflow": 0.0, "outflow": 40.0, "net": -40.0},
+	}
+	assert data["period"] == {"from_date": "2026-01-01", "to_date": "2026-01-01", "timezone": "Asia/Riyadh"}
+
+
+def test_list_collection_payments_combines_a_single_currency_into_one_total(monkeypatch):
+	runtime = fake_frappe()
+	runtime.local.request = SimpleNamespace(method="GET", headers={})
+
+	class FakeMeta:
+		def has_field(self, name):
+			return False  # no currency field on this site's doctype
+
+	runtime.get_meta = lambda dt: FakeMeta()
+
+	summary_parents = [
+		{"name": "CP-1", "status": "Approved", "docstatus": 1},
+		{"name": "CP-2", "status": "Paid", "docstatus": 1},
+	]
+	child_rows_by_parent = {
+		"CP-1": [{"parent": "CP-1", "payment_type": "Receive", "amount": 100}],
+		"CP-2": [{"parent": "CP-2", "payment_type": "Pay", "amount": 30}],
+	}
+
+	def fake_get_list(doctype, **kwargs):
+		fields = kwargs.get("fields") or []
+		if "status" in fields and "docstatus" in fields:
+			return list(summary_parents)
+		return []
+
+	def fake_get_all(doctype, **kwargs):
+		filters = kwargs.get("filters") or {}
+		parent_in = filters.get("parent", (None, []))[1]
+		rows = [r for name in parent_in for r in child_rows_by_parent.get(name, [])]
+		return rows
+
+	runtime.get_list = fake_get_list
+	runtime.get_all = fake_get_all
+	_patch(monkeypatch, payment, runtime)
+	_patch(monkeypatch, security, runtime)
+	_patch(monkeypatch, _dates, runtime)
+	monkeypatch.setattr(payment, "set_cors_headers", lambda methods: None)
+	monkeypatch.setattr(payment, "require_authenticated_user", lambda: "user@example.com")
+	monkeypatch.setattr(payment, "require_doctype_permission", lambda *a, **k: None)
+
+	resp = payment.list_collection_payments(from_date="2026-01-01", to_date="2026-01-01")
+	summary = resp["data"]["summary"]
+	assert summary["totals"] == {"inflow": 100.0, "outflow": 30.0, "net": 70.0, "basis": "approved"}
+	assert "totals_by_currency" not in summary  # no currency field on this site -- nothing to group
+
+
+# --------------------------------------------------------------------------- #
+#  never frappe.get_all() on the private parent doctypes                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_invoice_and_payment_summaries_never_get_all_the_parent_doctype():
+	"""Static guard for requirement #2: frappe.get_all() bypasses permission
+	checks, so it must never be used for Invoice Form / Collection and
+	Payment rows -- only frappe.get_list() (which is permission-aware). The
+	one frappe.get_all() call in payment.py is scoped to Collection and
+	Payment DETAILS rows, already restricted to an already-permission-
+	filtered set of parent names (child tables carry no permissions of
+	their own in Frappe)."""
+	invoice_source = inspect.getsource(invoice)
+	assert "frappe.get_all(" not in invoice_source, (
+		"invoice.py must use frappe.get_list() (permission-aware), never frappe.get_all()"
+	)
+
+	payment_source = inspect.getsource(payment)
+	get_all_calls = [i for i, line in enumerate(payment_source.splitlines()) if "frappe.get_all(" in line]
+	assert get_all_calls, "expected at least one frappe.get_all() call (Collection and Payment Details)"
+	lines = payment_source.splitlines()
+	for i in get_all_calls:
+		# The doctype name is the next non-blank line (frappe.get_all( spans
+		# multiple lines in this file).
+		target = lines[i + 1] if i + 1 < len(lines) else ""
+		assert "Collection and Payment Details" in target, (
+			f"frappe.get_all() must only ever target the child Details table, got: {target!r}"
 		)

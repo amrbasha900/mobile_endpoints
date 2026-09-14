@@ -631,6 +631,115 @@ class TestDeleteOutcome(ReliabilityTestCase):
 
 
 # --------------------------------------------------------------------------- #
+#  invoice list: date-range period + server summary (Phase 02 increment 4)   #
+# --------------------------------------------------------------------------- #
+
+
+class TestInvoicePeriodAndSummary(ReliabilityTestCase):
+	def _get_invoices(self, **kw):
+		_set_get_request()
+		return invoice_api.get_invoices(**kw)
+
+	def test_default_period_is_today_in_the_site_timezone(self):
+		resp = _expect_success(self._get_invoices(page_size=1), "get_invoices")
+		today_str = frappe.utils.today()
+		self.assertEqual(resp["period"]["from_date"], today_str)
+		self.assertEqual(resp["period"]["to_date"], today_str)
+		self.assertTrue(resp["period"]["timezone"])
+
+	def test_explicit_period_presets_are_honored(self):
+		today = frappe.utils.getdate(frappe.utils.today())
+		yesterday = frappe.utils.add_days(today, -1)
+		last_7 = frappe.utils.add_days(today, -6)
+		last_30 = frappe.utils.add_days(today, -29)
+
+		for from_date, to_date in (
+			(str(yesterday), str(yesterday)),
+			(str(last_7), str(today)),
+			(str(last_30), str(today)),
+		):
+			resp = _expect_success(
+				self._get_invoices(from_date=from_date, to_date=to_date, page_size=1), "get_invoices"
+			)
+			self.assertEqual((resp["period"]["from_date"], resp["period"]["to_date"]), (from_date, to_date))
+
+	def test_invalid_date_is_422(self):
+		resp = self._get_invoices(from_date="not-a-date", to_date="2026-01-31")
+		self.assertFalse(resp["success"])
+		self.assertEqual(resp["error"]["code"], "validation_error")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 422)
+
+	def test_reversed_date_range_is_422(self):
+		resp = self._get_invoices(from_date="2026-02-01", to_date="2026-01-01")
+		self.assertFalse(resp["success"])
+		self.assertEqual(resp["error"]["code"], "validation_error")
+
+	def test_range_wider_than_the_limit_is_422(self):
+		resp = self._get_invoices(from_date="2020-01-01", to_date="2026-01-01")
+		self.assertFalse(resp["success"])
+		self.assertEqual(resp["error"]["code"], "validation_error")
+
+	def test_summary_is_identical_across_page_1_and_page_2(self):
+		today_str = frappe.utils.today()
+		for _i in range(3):
+			self.create_invoice_ok(str(uuid.uuid4()))
+
+		page1 = _expect_success(
+			self._get_invoices(from_date=today_str, to_date=today_str, page=1, page_size=1), "get_invoices p1"
+		)
+		page2 = _expect_success(
+			self._get_invoices(from_date=today_str, to_date=today_str, page=2, page_size=1), "get_invoices p2"
+		)
+		self.assertEqual(page1["summary"], page2["summary"])
+		self.assertGreaterEqual(page1["summary"]["draft"], 3)
+
+	def test_search_and_supplier_filters_affect_rows_and_summary_consistently(self):
+		today_str = frappe.utils.today()
+		before = _expect_success(
+			self._get_invoices(from_date=today_str, to_date=today_str, supplier=self.supplier, page_size=1),
+			"get_invoices (before)",
+		)
+		self.create_invoice_ok(str(uuid.uuid4()))
+		after = _expect_success(
+			self._get_invoices(from_date=today_str, to_date=today_str, supplier=self.supplier, page_size=1),
+			"get_invoices (after)",
+		)
+		self.assertEqual(after["summary"]["draft"], before["summary"]["draft"] + 1)
+		self.assertEqual(after["summary"]["total"], before["summary"]["total"] + 1)
+
+	def test_selected_status_filter_does_not_hide_the_other_status_cards(self):
+		today_str = frappe.utils.today()
+		self.create_invoice_ok(str(uuid.uuid4()))
+		submitted_name = self.create_invoice_ok(str(uuid.uuid4()))["name"]
+		self.submit_invoice(submitted_name, client_request_id=str(uuid.uuid4()))
+
+		resp = _expect_success(
+			self._get_invoices(from_date=today_str, to_date=today_str, status="submitted", page_size=1),
+			"get_invoices (status=submitted)",
+		)
+		# Even while filtering rows to "submitted", the summary must still
+		# report the (non-zero) draft count -- not just the active tab's.
+		self.assertGreaterEqual(resp["summary"]["submitted"], 1)
+		self.assertGreaterEqual(resp["summary"]["draft"], 1)
+
+	def test_cross_user_gets_no_rows_no_counts_not_a_403_disguised_as_zero(self):
+		"""A user with zero document permission on Invoice Form must be
+		refused outright (403) -- never a "successful" empty/zero summary
+		that could be mistaken for "no invoices exist"."""
+		self.create_invoice_ok(str(uuid.uuid4()))  # as Administrator
+
+		frappe.set_user(self.other_user)
+		try:
+			resp = self._get_invoices(page_size=1)
+		finally:
+			frappe.set_user("Administrator")
+
+		self.assertFalse(resp["success"])
+		self.assertEqual(resp["error"]["code"], "permission_denied")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 403)
+
+
+# --------------------------------------------------------------------------- #
 #  payment company resolution (BR-06) + idempotency                          #
 # --------------------------------------------------------------------------- #
 
@@ -741,6 +850,92 @@ class TestPaymentCompany(ReliabilityTestCase):
 
 		self.assertEqual(second["name"], first["name"])
 		self.assertEqual(before, after, "replaying the same payment key created a duplicate")
+
+
+class TestPaymentPeriodAndSummary(TestPaymentCompany):
+	"""Inherits TestPaymentCompany's Mode of Payment / company fixtures and
+	_payment_body()/_create_payment() helpers -- these are period/summary-
+	specific tests only, not a rerun of the company-resolution ones above."""
+
+	def _get_payments(self, **kw):
+		_set_get_request()
+		return payment_api.list_collection_payments(**kw)
+
+	@staticmethod
+	def _force_status(name: str, status: str) -> None:
+		"""Test-only: directly set a workflow status the create API itself
+		has no way to reach (it never accepts a client-supplied status)."""
+		frappe.db.set_value("Collection and Payment", name, "status", status)
+		frappe.db.commit()
+
+	def test_default_period_is_today_in_the_site_timezone(self):
+		resp = _expect_success(self._get_payments(page_size=1), "list_collection_payments")
+		today_str = frappe.utils.today()
+		self.assertEqual(resp["period"]["from_date"], today_str)
+		self.assertEqual(resp["period"]["to_date"], today_str)
+		self.assertTrue(resp["period"]["timezone"])
+
+	def test_approved_payment_is_counted_in_totals_with_the_correct_direction(self):
+		frappe.defaults.set_user_default("company", self.company)
+		pay = _expect_success(self._create_payment(self._payment_body()), "create (Pay)")
+		self._force_status(pay["name"], "Approved")
+
+		receive_body = self._payment_body()
+		receive_body["detail"]["payment_type"] = "Receive"
+		receive_body["detail"]["amount"] = 25
+		receive = _expect_success(self._create_payment(receive_body), "create (Receive)")
+		self._force_status(receive["name"], "Approved")
+
+		today_str = frappe.utils.today()
+		resp = _expect_success(
+			self._get_payments(from_date=today_str, to_date=today_str, page_size=1), "list_collection_payments"
+		)
+		totals = resp["summary"]["totals"]
+		self.assertEqual(totals["basis"], "approved")
+		self.assertGreaterEqual(totals["outflow"], 10)  # the "Pay" leg
+		self.assertGreaterEqual(totals["inflow"], 25)  # the "Receive" leg
+
+	def test_pending_and_rejected_are_excluded_from_financial_totals(self):
+		frappe.defaults.set_user_default("company", self.company)
+		today_str = frappe.utils.today()
+
+		before = _expect_success(
+			self._get_payments(from_date=today_str, to_date=today_str, page_size=1), "list_collection_payments (before)"
+		)
+
+		pending_body = self._payment_body()
+		pending_body["detail"]["amount"] = 999999  # would obviously skew totals if wrongly included
+		pending = _expect_success(self._create_payment(pending_body), "create (left pending)")
+		# Deliberately NOT forced to Approved -- whatever the default status
+		# is, it must not be "approved" per _normalize_payment_status.
+
+		rejected_body = self._payment_body()
+		rejected_body["detail"]["amount"] = 888888
+		rejected = _expect_success(self._create_payment(rejected_body), "create (rejected)")
+		self._force_status(rejected["name"], "Rejected")
+
+		after = _expect_success(
+			self._get_payments(from_date=today_str, to_date=today_str, page_size=1), "list_collection_payments (after)"
+		)
+
+		self.assertEqual(after["summary"]["totals"], before["summary"]["totals"])
+		self.assertEqual(after["summary"]["pending"], before["summary"]["pending"] + 1)
+		self.assertEqual(after["summary"]["rejected"], before["summary"]["rejected"] + 1)
+		self.assertEqual(after["summary"]["approved"], before["summary"]["approved"])
+
+	def test_cross_user_gets_403_not_fake_zero_summary(self):
+		frappe.defaults.set_user_default("company", self.company)
+		self._create_payment(self._payment_body())  # as Administrator
+
+		frappe.set_user(self.other_user)
+		try:
+			resp = self._get_payments(page_size=1)
+		finally:
+			frappe.set_user("Administrator")
+
+		self.assertFalse(resp["success"])
+		self.assertEqual(resp["error"]["code"], "permission_denied")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 403)
 
 
 # --------------------------------------------------------------------------- #

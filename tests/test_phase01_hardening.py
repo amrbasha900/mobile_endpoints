@@ -7,6 +7,7 @@ given an explicit fake Frappe runtime.
 
 from __future__ import annotations
 
+import datetime
 import importlib.util
 import json
 import sys
@@ -68,11 +69,18 @@ if importlib.util.find_spec("frappe") is None:
 	frappe_utils = types.ModuleType("frappe.utils")
 	frappe_utils.cint = lambda value: int(value or 0)
 	frappe_utils.cstr = lambda value: "" if value is None else str(value)
-	frappe_utils.flt = lambda value: float(value or 0)
+	frappe_utils.flt = lambda value, precision=None: (
+		round(float(value or 0), precision) if precision is not None else float(value or 0)
+	)
 	frappe_utils.get_url = lambda: "https://erp.example.com"
 	frappe_utils.now_datetime = lambda: None
 	frappe_utils.nowtime = lambda: "00:00:00"
 	frappe_utils.today = lambda: "2026-09-09"
+	frappe_utils.getdate = lambda v: (
+		v if isinstance(v, datetime.date) else datetime.datetime.strptime(str(v), "%Y-%m-%d").date()
+	)
+	frappe_utils.get_system_timezone = lambda: "Asia/Riyadh"
+	frappe_stub.utils = frappe_utils
 
 	file_manager = types.ModuleType("frappe.utils.file_manager")
 	file_manager.save_file = lambda *args, **kwargs: None
