@@ -327,11 +327,7 @@ class ReliabilityTestCase(FrappeTestCase):
 		self._docs_to_delete: list[tuple[str, str]] = []
 
 	def tearDown(self):
-		for doctype, name in reversed(self._docs_to_delete):
-			with contextlib.suppress(Exception):
-				frappe.delete_doc(doctype, name, force=True, ignore_permissions=True)
-		with contextlib.suppress(Exception):
-			frappe.db.commit()
+		self._cleanup_tracked_docs()
 		frappe.set_user("Administrator")
 		super().tearDown()
 
@@ -343,9 +339,46 @@ class ReliabilityTestCase(FrappeTestCase):
 		if client_request_id:
 			self.track(LOG_DOCTYPE, _composite(user or frappe.session.user, scope, client_request_id))
 
+	@staticmethod
+	def _cancel_if_submitted(doctype: str, name: str) -> None:
+		"""Frappe refuses to delete a submitted (docstatus=1) document outright
+		('Submitted Record cannot be deleted') -- cancel it first. Safe to call
+		on a doctype with no docstatus concept, a document that no longer
+		exists, or one that is already draft/cancelled."""
+		try:
+			docstatus = frappe.db.get_value(doctype, name, "docstatus")
+		except Exception:
+			return
+		if docstatus != 1:
+			return
+		doc = frappe.get_doc(doctype, name)
+		doc.flags.ignore_permissions = True
+		doc.cancel()
+		frappe.db.commit()
+
+	def _cleanup_tracked_docs(self) -> None:
+		"""Cancel-then-delete every document this test tracked via track()/
+		track_log(), most-recently-tracked first. Idempotent and safe to call
+		more than once (e.g. once mid-test for a regression assertion, then
+		again from tearDown): each entry is popped as it's processed, a
+		missing document is a no-op (delete_doc's default ignore_missing),
+		and every step is isolated so one failure can't skip the rest -- this
+		must clean up equally well after a failed assertion as after a pass.
+		Only ever touches (doctype, name) pairs THIS test itself tracked, so
+		it never reaches for unrelated/pre-existing records."""
+		while self._docs_to_delete:
+			doctype, name = self._docs_to_delete.pop()
+			with contextlib.suppress(Exception):
+				self._cancel_if_submitted(doctype, name)
+			with contextlib.suppress(Exception):
+				frappe.delete_doc(doctype, name, force=True, ignore_permissions=True)
+		with contextlib.suppress(Exception):
+			frappe.db.commit()
+
 	# -- convenience wrappers: call the real endpoint the way a real HTTP
 	#    request would (Frappe's dispatcher binds body fields matching the
-	#    signature as kwargs) AND register cleanup --
+	#    signature as kwargs) AND register cleanup for whatever they created,
+	#    including the Mobile Request Log row for that call --
 
 	def create_invoice(self, client_request_id, qty=2, price=50) -> dict:
 		body = {
@@ -390,21 +423,34 @@ class ReliabilityTestCase(FrappeTestCase):
 		# name/data ARE in update_invoice's signature -- a real dispatched call
 		# binds them directly; base_modified/client_request_id are not, and
 		# reach the handler only via _request_meta() reading the raw body above.
-		return invoice_api.update_invoice(name=name, data=data)
+		resp = invoice_api.update_invoice(name=name, data=data)
+		if resp.get("success"):
+			self.track_log("invoice.update", client_request_id)
+		return resp
 
 	def submit_invoice(self, name: str, client_request_id=None) -> dict:
 		body = {"name": name}
 		if client_request_id is not None:
 			body["client_request_id"] = client_request_id
 		_set_post_body(body)
-		return invoice_api.submit_invoice(name=name)
+		resp = invoice_api.submit_invoice(name=name)
+		if resp.get("success"):
+			# The invoice itself is already tracked (as of create_invoice()) --
+			# submitting it doesn't create a new document, just a new log row
+			# under the "invoice.submit" scope. _cleanup_tracked_docs() cancels
+			# the now-submitted Invoice Form before deleting it.
+			self.track_log("invoice.submit", client_request_id)
+		return resp
 
 	def delete_invoice(self, name: str, client_request_id=None) -> dict:
 		body = {"name": name}
 		if client_request_id is not None:
 			body["client_request_id"] = client_request_id
 		_set_post_body(body)
-		return invoice_api.delete_invoice(name=name)
+		resp = invoice_api.delete_invoice(name=name)
+		if resp.get("success"):
+			self.track_log("invoice.delete", client_request_id)
+		return resp
 
 
 # --------------------------------------------------------------------------- #
@@ -461,11 +507,58 @@ class TestIdempotentCreate(ReliabilityTestCase):
 		created = self.create_invoice_ok(key)["name"]
 
 		submitted = self.submit_invoice(created, client_request_id=key)
-		self.track_log("invoice.submit", key)
 		# Different scope -> different composite key -> the submit is NOT treated
 		# as a replay of the create.
 		data = _expect_success(submitted, "submit_invoice")
 		self.assertEqual(data["name"], created)
+
+
+class TestCleanup(ReliabilityTestCase):
+	"""Regression coverage for the stray-submitted-invoice bug: tearDown() used
+	to call frappe.delete_doc() straight on a tracked document, and Frappe
+	refuses to delete a submitted (docstatus=1) one outright -- the exception
+	was swallowed by the per-item contextlib.suppress(Exception), silently
+	leaving it behind (e.g. an invoice created and submitted by
+	test_same_key_across_different_operations_is_independent above)."""
+
+	def test_cleanup_cancels_and_removes_a_submitted_invoice(self):
+		created = self.create_invoice_ok(str(uuid.uuid4()))
+		name = created["name"]
+		submitted = self.submit_invoice(name, client_request_id=str(uuid.uuid4()))
+		_expect_success(submitted, "submit_invoice")
+		self.assertEqual(
+			frappe.db.get_value("Invoice Form", name, "docstatus"), 1, "setup did not actually submit the invoice"
+		)
+
+		# Exercise the exact path tearDown() uses, mid-test, so this test can
+		# assert on the outcome itself rather than only trusting tearDown to
+		# not raise.
+		self._cleanup_tracked_docs()
+
+		self.assertFalse(
+			frappe.db.exists("Invoice Form", name), "a submitted invoice survived cleanup (must cancel, then delete)"
+		)
+		self.assertEqual(
+			self._docs_to_delete, [], "cleanup must drain the tracked-docs list so it is safe to call again"
+		)
+		# Idempotent: calling it again (as tearDown() itself will, right after
+		# this test returns) must not raise even though everything is gone.
+		self._cleanup_tracked_docs()
+
+	def test_cleanup_only_targets_this_tests_own_tracked_documents(self):
+		untouched = self.create_invoice_ok(str(uuid.uuid4()))["name"]
+		self._docs_to_delete.clear()  # simulate: never tracked by this test
+
+		mine = self.create_invoice_ok(str(uuid.uuid4()))["name"]
+		self._cleanup_tracked_docs()
+
+		self.assertFalse(frappe.db.exists("Invoice Form", mine), "a tracked document survived cleanup")
+		self.assertTrue(
+			frappe.db.exists("Invoice Form", untouched),
+			"cleanup deleted a document this test never tracked -- it must only ever "
+			"touch records this test itself created",
+		)
+		self.track("Invoice Form", untouched)  # let the real tearDown() remove it
 
 
 class TestCrossUserIsolation(ReliabilityTestCase):
@@ -509,7 +602,6 @@ class TestOptimisticConcurrency(ReliabilityTestCase):
 			self.update_invoice(created["name"], items, created["modified"], client_request_id=key),
 			"update_invoice",
 		)
-		self.track_log("invoice.update", key)
 		self.assertEqual(first["grand_total"], 30)
 
 		# Replay with the same key returns the stored result even though
@@ -527,7 +619,6 @@ class TestDeleteOutcome(ReliabilityTestCase):
 		key = str(uuid.uuid4())
 
 		first = _expect_success(self.delete_invoice(created, client_request_id=key), "delete_invoice")
-		self.track_log("invoice.delete", key)
 		self.assertTrue(first["deleted"])
 
 		replay = _expect_success(self.delete_invoice(created, client_request_id=key), "delete_invoice (replay)")
