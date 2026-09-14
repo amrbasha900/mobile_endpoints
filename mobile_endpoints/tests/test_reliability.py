@@ -938,6 +938,132 @@ class TestPaymentPeriodAndSummary(TestPaymentCompany):
 		self.assertEqual(frappe.local.response.get("http_status_code"), 403)
 
 
+class TestPaymentFilters(TestPaymentCompany):
+	"""Search / party / company / payment-type filters (Phase 02 increment 5:
+	closing the "rows vs counters can disagree" gap for Transactions -- see
+	TestInvoicePeriodAndSummary for the equivalent invoice coverage).
+
+	test_cross_user_search_reveals_no_rows_counts_or_totals covers BOTH "a
+	child-row match under an unauthorized parent is never returned" and
+	"cross-user search cannot reveal rows/counts/totals" via the same
+	zero-permission other_user mechanism used elsewhere in this file -- a
+	more granular "some records authorized, some not via User Permissions"
+	scenario would need this site's actual permission configuration, which
+	cannot be fabricated generically here."""
+
+	def _get_payments(self, **kw):
+		_set_get_request()
+		return payment_api.list_collection_payments(**kw)
+
+	def _create_payment_as_admin(self, **overrides) -> dict:
+		frappe.defaults.set_user_default("company", self.company)
+		body = self._payment_body()
+		body["detail"].update(overrides)
+		return _expect_success(self._create_payment(body), "create_collection_payment")
+
+	def test_search_changes_rows_and_summary_consistently(self):
+		today_str = frappe.utils.today()
+		distinct_party_name = f"{TEST_PREFIX}-SEARCH-TARGET-{uuid.uuid4().hex[:8]}"
+		matching = self._create_payment_as_admin(party_name=distinct_party_name)
+		self._create_payment_as_admin()  # a second, non-matching payment
+
+		resp = _expect_success(
+			self._get_payments(from_date=today_str, to_date=today_str, search=distinct_party_name, page_size=10),
+			"list_collection_payments (search)",
+		)
+		names = [row["name"] for row in resp["payments"]]
+		self.assertIn(matching["name"], names)
+		self.assertEqual(resp["summary"]["total"], len(names), "summary must match the searched, not the full, set")
+
+	def test_party_type_and_party_change_rows_and_summary_consistently(self):
+		today_str = frappe.utils.today()
+		mine = self._create_payment_as_admin(party_type="Customer", party=self.customer, party_name=self.customer)
+
+		resp = _expect_success(
+			self._get_payments(
+				from_date=today_str, to_date=today_str, party_type="Customer", party=self.customer, page_size=10
+			),
+			"list_collection_payments (party filter)",
+		)
+		self.assertTrue(all(row["party"] == self.customer for row in resp["payments"]))
+		self.assertGreaterEqual(len(resp["payments"]), 1)
+		self.assertIn(mine["name"], [row["name"] for row in resp["payments"]])
+		self.assertEqual(resp["summary"]["total"], len(resp["payments"]))
+
+	def test_company_and_payment_type_change_rows_and_summary_consistently(self):
+		today_str = frappe.utils.today()
+		pay_leg = self._create_payment_as_admin(payment_type="Pay")
+		receive_body = self._payment_body()
+		receive_body["detail"]["payment_type"] = "Receive"
+		frappe.defaults.set_user_default("company", self.company)
+		self._create_payment(receive_body)
+
+		resp = _expect_success(
+			self._get_payments(
+				from_date=today_str, to_date=today_str, company=self.company, payment_type="pay", page_size=10
+			),
+			"list_collection_payments (payment_type filter)",
+		)
+		self.assertTrue(all(row["payment_type"] == "Pay" for row in resp["payments"]))
+		self.assertIn(pay_leg["name"], [row["name"] for row in resp["payments"]])
+		self.assertEqual(resp["summary"]["total"], len(resp["payments"]))
+
+	def test_pagination_does_not_change_the_summary_under_a_filter(self):
+		today_str = frappe.utils.today()
+		for _i in range(3):
+			self._create_payment_as_admin()
+
+		page1 = _expect_success(
+			self._get_payments(from_date=today_str, to_date=today_str, company=self.company, page=1, page_size=1),
+			"list_collection_payments p1",
+		)
+		page2 = _expect_success(
+			self._get_payments(from_date=today_str, to_date=today_str, company=self.company, page=2, page_size=1),
+			"list_collection_payments p2",
+		)
+		self.assertEqual(page1["summary"], page2["summary"])
+		self.assertGreaterEqual(page1["summary"]["total"], 3)
+
+	def test_active_status_filter_is_ignored_only_for_the_summary(self):
+		today_str = frappe.utils.today()
+		approved = self._create_payment_as_admin()
+		self._force_status(approved["name"], "Approved")
+		pending = self._create_payment_as_admin()  # left at its default (non-approved) status
+
+		resp = _expect_success(
+			self._get_payments(
+				from_date=today_str, to_date=today_str, company=self.company, status="pending", page_size=10
+			),
+			"list_collection_payments (status=pending)",
+		)
+		row_names = [row["name"] for row in resp["payments"]]
+		self.assertIn(pending["name"], row_names)
+		self.assertNotIn(approved["name"], row_names, "the pending row filter must exclude the approved payment")
+		# But the summary (status-card counts) must still see BOTH -- the
+		# active status filter is excluded only from the summary scope, not
+		# from the company filter, which must remain applied.
+		self.assertGreaterEqual(resp["summary"]["approved"], 1)
+		self.assertGreaterEqual(resp["summary"]["pending"], 1)
+
+	def test_cross_user_search_reveals_no_rows_counts_or_totals(self):
+		distinct_party_name = f"{TEST_PREFIX}-CROSS-USER-{uuid.uuid4().hex[:8]}"
+		self._create_payment_as_admin(party_name=distinct_party_name)
+
+		frappe.set_user(self.other_user)
+		try:
+			resp = self._get_payments(search=distinct_party_name, page_size=10)
+		finally:
+			frappe.set_user("Administrator")
+
+		# self.other_user has zero document permission on Collection and
+		# Payment -- a search/filter must not weaken that into a 200 with an
+		# empty-but-successful envelope (which could be mistaken for "no
+		# matches" rather than "not authorized"); it must still be a 403.
+		self.assertFalse(resp["success"])
+		self.assertEqual(resp["error"]["code"], "permission_denied")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 403)
+
+
 # --------------------------------------------------------------------------- #
 #  operation status / envelope                                               #
 # --------------------------------------------------------------------------- #

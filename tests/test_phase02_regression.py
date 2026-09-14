@@ -1043,3 +1043,149 @@ def test_invoice_and_payment_summaries_never_get_all_the_parent_doctype():
 		assert "Collection and Payment Details" in target, (
 			f"frappe.get_all() must only ever target the child Details table, got: {target!r}"
 		)
+
+
+# --------------------------------------------------------------------------- #
+#  list_collection_payments filters (search / party / company / type)        #
+# --------------------------------------------------------------------------- #
+
+
+def _payment_filter_harness(monkeypatch):
+	"""Common rig for the filter-construction tests below: records every
+	frappe.get_list / frappe.get_all call (doctype, filters, or_filters) and
+	returns empty results, since these tests assert on HOW the query was
+	built, not on row data (that's covered by the summary-math tests above)."""
+	runtime = fake_frappe()
+	runtime.local.request = SimpleNamespace(method="GET", headers={})
+	calls: list[dict] = []
+
+	class FakeMeta:
+		def has_field(self, name):
+			return False  # no currency field -- keep these tests focused on filters
+
+	runtime.get_meta = lambda dt: FakeMeta()
+
+	def fake_get_list(doctype, **kwargs):
+		calls.append({"fn": "get_list", "doctype": doctype, **kwargs})
+		return []
+
+	def fake_get_all(doctype, **kwargs):
+		calls.append({"fn": "get_all", "doctype": doctype, **kwargs})
+		return []
+
+	runtime.get_list = fake_get_list
+	runtime.get_all = fake_get_all
+	_patch(monkeypatch, payment, runtime)
+	_patch(monkeypatch, security, runtime)
+	_patch(monkeypatch, _dates, runtime)
+	# Needed so mobile_api's `except frappe.ValidationError` matches the
+	# exception frappe.throw(..., frappe.ValidationError) raises here --
+	# see the invalid party_type/payment_type tests below. Whichever test
+	# module's stub wins pytest's collection race owns _envelope's default
+	# `frappe.ValidationError`, which is not guaranteed to be THIS runtime's.
+	_patch(monkeypatch, _envelope, runtime)
+	monkeypatch.setattr(payment, "set_cors_headers", lambda methods: None)
+	monkeypatch.setattr(payment, "require_authenticated_user", lambda: "user@example.com")
+	monkeypatch.setattr(payment, "require_doctype_permission", lambda *a, **k: None)
+	return calls
+
+
+def _rows_call(calls):
+	return next(c for c in calls if c["fn"] == "get_list" and "posting_date" in (c.get("fields") or []))
+
+
+def _summary_call(calls):
+	return next(c for c in calls if c["fn"] == "get_list" and "docstatus" in (c.get("fields") or []))
+
+
+def test_search_filters_rows_and_summary_via_the_child_table_join(monkeypatch):
+	calls = _payment_filter_harness(monkeypatch)
+	resp = payment.list_collection_payments(from_date="2026-01-01", to_date="2026-01-01", search="Ali")
+	assert resp["success"] is True
+
+	for call in (_rows_call(calls), _summary_call(calls)):
+		assert call["or_filters"] == [
+			["Collection and Payment Details", "party_name", "like", "%Ali%"],
+			["Collection and Payment Details", "party", "like", "%Ali%"],
+		]
+
+
+def test_party_type_and_party_filter_rows_and_summary_identically(monkeypatch):
+	calls = _payment_filter_harness(monkeypatch)
+	resp = payment.list_collection_payments(
+		from_date="2026-01-01", to_date="2026-01-01", party_type="Customer", party="CUST-1"
+	)
+	assert resp["success"] is True
+
+	expected = [
+		["Collection and Payment Details", "party_type", "=", "Customer"],
+		["Collection and Payment Details", "party", "=", "CUST-1"],
+	]
+	for call in (_rows_call(calls), _summary_call(calls)):
+		for cond in expected:
+			assert cond in call["filters"]
+
+
+def test_company_and_payment_type_filter_rows_and_summary_identically(monkeypatch):
+	calls = _payment_filter_harness(monkeypatch)
+	resp = payment.list_collection_payments(
+		from_date="2026-01-01", to_date="2026-01-01", company="Acme Co", payment_type="pay"
+	)
+	assert resp["success"] is True
+
+	expected = [
+		["company", "=", "Acme Co"],
+		["Collection and Payment Details", "payment_type", "=", "Pay"],
+	]
+	for call in (_rows_call(calls), _summary_call(calls)):
+		for cond in expected:
+			assert cond in call["filters"]
+
+
+def test_active_status_filter_applies_to_rows_only_not_the_summary(monkeypatch):
+	calls = _payment_filter_harness(monkeypatch)
+	resp = payment.list_collection_payments(from_date="2026-01-01", to_date="2026-01-01", status="rejected")
+	assert resp["success"] is True
+
+	rows_filters = _rows_call(calls)["filters"]
+	summary_filters = _summary_call(calls)["filters"]
+	assert ["status", "=", "Rejected"] in rows_filters
+	assert ["status", "=", "Rejected"] not in summary_filters
+	assert not any(isinstance(f, list) and f and f[0] == "status" for f in summary_filters)
+
+
+def test_invalid_party_type_is_422(monkeypatch):
+	_payment_filter_harness(monkeypatch)
+	resp = payment.list_collection_payments(from_date="2026-01-01", to_date="2026-01-01", party_type="Vendor")
+	assert resp["success"] is False
+	assert resp["error"]["code"] == "validation_error"
+
+
+def test_invalid_payment_type_is_422(monkeypatch):
+	_payment_filter_harness(monkeypatch)
+	resp = payment.list_collection_payments(from_date="2026-01-01", to_date="2026-01-01", payment_type="Transfer")
+	assert resp["success"] is False
+	assert resp["error"]["code"] == "validation_error"
+
+
+def test_status_row_filter_pending_excludes_approved_and_rejected_values():
+	assert payment._status_row_filter("pending") == ["status", "not in", ["Approved", "Paid", "Rejected"]]
+	assert payment._status_row_filter("approved") == ["status", "in", ["Approved", "Paid"]]
+	assert payment._status_row_filter("rejected") == ["status", "=", "Rejected"]
+
+
+def test_no_unrestricted_child_table_scan_in_list_collection_payments():
+	"""Every frappe.get_all() call (the only doctype-permission-bypassing
+	call in this function) must be scoped to an already-permission-fetched
+	parent name list -- never an unconditional/unrestricted child scan whose
+	results are trusted directly."""
+	source = inspect.getsource(payment.list_collection_payments)
+	get_all_lines = [i for i, line in enumerate(source.splitlines()) if "frappe.get_all(" in line]
+	assert get_all_lines, "expected frappe.get_all() calls for child detail rows"
+	lines = source.splitlines()
+	for i in get_all_lines:
+		# the filters={"parent": (...)} argument is on one of the next few lines
+		window = "\n".join(lines[i : i + 4])
+		assert '"parent": ("in",' in window or "'parent': ('in'," in window, (
+			f"frappe.get_all() call must be scoped to an already-fetched parent name list: {window!r}"
+		)

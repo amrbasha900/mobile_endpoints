@@ -208,6 +208,24 @@ def _normalize_payment_status(value) -> str:
 	return "pending"
 
 
+def _status_row_filter(status: str) -> list:
+	"""Row-level SQL condition for one status bucket. `not in` is used (not a
+	`!=`/exclusion built from _normalize_payment_status's blank->pending rule)
+	because Frappe's query builder is documented to treat `!=`/`not in`
+	filters as NULL-inclusive (`(status NOT IN (...) OR status IS NULL)`) --
+	unlike a bare SQL `!=`/`NOT IN`, which would silently drop blank-status
+	rows from "pending". This specific NULL-inclusive behavior is the one
+	piece of this change that could not be verified without a live bench --
+	see TestPaymentFilters.test_pending_status_filter_includes_blank_status
+	in test_reliability.py, which must pass on the real bench before this is
+	trusted for the "pending" bucket."""
+	if status == "approved":
+		return ["status", "in", ["Approved", "Paid"]]
+	if status == "rejected":
+		return ["status", "=", "Rejected"]
+	return ["status", "not in", ["Approved", "Paid", "Rejected"]]
+
+
 @frappe.whitelist(allow_guest=True, methods=["GET"])
 @mobile_api
 def list_collection_payments(
@@ -218,12 +236,27 @@ def list_collection_payments(
 	from_date: str | None = None,
 	to_date: str | None = None,
 	company: str | None = None,
+	search: str | None = None,
+	party_type: str | None = None,
+	party: str | None = None,
+	payment_type: str | None = None,
+	status: str | None = None,
 ):
 	"""
 	GET /api/method/mobile_endpoints.api.payment.list_collection_payments
 	Returns only documents where pamper_collection_and_payment = 1.
 	`from_date`/`to_date` are canonical (`start_date`/`end_date` kept as
 	aliases); neither given -> defaults to "today" in the site timezone.
+
+	`party_type`/`party`/`payment_type`/`search` filter on the CHILD
+	"Collection and Payment Details" table via frappe.get_list's child-table
+	filter form (`[child_doctype, fieldname, operator, value]`) applied to
+	the PARENT doctype query -- the join and the permission-query condition
+	execute as ONE query, so a child-row match can never surface a parent the
+	caller isn't authorized to see. This is the one part of this change that
+	could not be verified without a live bench (see the module docstring's
+	"Request-harness policy" and TestPaymentFilters below); no unrestricted
+	child-table scan is used anywhere in this function.
 	"""
 	set_cors_headers("GET, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
@@ -238,8 +271,11 @@ def list_collection_payments(
 
 	resolved_from, resolved_to = resolve_period(from_date or start_date, to_date or end_date)
 
-	# Shared by rows AND the summary below (BR-06 style: only non-status
-	# filters are shared, so a status card never hides the others).
+	# Shared by rows AND the summary below: date/company/search/party/
+	# payment_type -- only STATUS is excluded from base_filters (applied
+	# separately, below, to `filters` for rows only), so a status card never
+	# hides the others and a status-filtered list still reports accurate
+	# counts for every OTHER status.
 	base_filters = [
 		["pamper_collection_and_payment", "=", 1],
 		["posting_date", ">=", resolved_from],
@@ -248,12 +284,48 @@ def list_collection_payments(
 	if company:
 		base_filters.append(["company", "=", cstr(company)])
 
+	if party_type is not None:
+		party_type = cstr(party_type).strip()
+		if party_type not in PARTY_NAME_FIELDS:
+			frappe.throw(_("Unsupported party type"), frappe.ValidationError)
+		base_filters.append(["Collection and Payment Details", "party_type", "=", party_type])
+
+	if party:
+		base_filters.append(["Collection and Payment Details", "party", "=", cstr(party)])
+
+	if payment_type is not None:
+		normalized_payment_type = cstr(payment_type).strip().title()
+		if normalized_payment_type not in {"Pay", "Receive"}:
+			frappe.throw(_("Unsupported payment type"), frappe.ValidationError)
+		base_filters.append(["Collection and Payment Details", "payment_type", "=", normalized_payment_type])
+
+	or_filters = None
+	s = cstr(search).strip() if search else ""
+	if s:
+		# Free-text party search -- name and identifier, matching the
+		# deployed client's own search semantics for "who this payment is
+		# with". Amount/date substring matching is intentionally NOT
+		# replicated here: date now has a dedicated, more precise range
+		# filter (from_date/to_date) and amount-substring matching against a
+		# decimal column has no safe equivalent in frappe.get_list's filter
+		# DSL -- see the increment's commit message for this scope decision.
+		or_filters = [
+			["Collection and Payment Details", "party_name", "like", f"%{s}%"],
+			["Collection and Payment Details", "party", "like", f"%{s}%"],
+		]
+
+	filters = list(base_filters)
+	if status:
+		normalized_status = _normalize_payment_status(status)
+		filters.append(_status_row_filter(normalized_status))
+
 	meta = frappe.get_meta("Collection and Payment")
 	has_currency_field = meta.has_field("currency")
 
 	parents = frappe.get_list(
 		"Collection and Payment",
-		filters=base_filters,
+		filters=filters,
+		or_filters=or_filters,
 		fields=["name", "posting_date", "company", "owner", "creation", "status"],
 		order_by="creation desc",
 		limit_start=start,
@@ -282,6 +354,8 @@ def list_collection_payments(
 			order_by="idx asc",
 		)
 
+	# Assumes (as the pre-existing code already did) one relevant detail row
+	# per parent -- create_collection_payment() always inserts exactly one.
 	first_row_map: dict[str, dict[str, Any]] = {}
 	for row in child_rows:
 		first_row_map.setdefault(row["parent"], row)
@@ -308,8 +382,11 @@ def list_collection_payments(
 		)
 
 	# --- summary -------------------------------------------------------
-	# Every authorized record in the SAME date/company window as the rows
-	# above -- the whole filtered set, not just this page. Cancelled
+	# Every authorized record matching the SAME date/company/search/party/
+	# payment_type filters as the rows above (base_filters + or_filters,
+	# deliberately NOT `filters`, which also carries the active status
+	# filter) -- the whole filtered set, not just this page, and never
+	# narrowed to just the status card currently selected. Cancelled
 	# (docstatus=2) parents are excluded entirely (never counted, never
 	# included in financial totals). Permission-aware throughout:
 	# frappe.get_list for the parent scope, never get_all/ignore_permissions;
@@ -321,6 +398,7 @@ def list_collection_payments(
 	summary_parents = frappe.get_list(
 		"Collection and Payment",
 		filters=base_filters + [["docstatus", "!=", 2]],
+		or_filters=or_filters,
 		fields=summary_fields,
 		limit_page_length=0,
 	)
