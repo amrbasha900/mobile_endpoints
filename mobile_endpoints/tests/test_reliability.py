@@ -1099,6 +1099,284 @@ class TestPaymentFilters(TestPaymentCompany):
 		self.assertEqual(frappe.local.response.get("http_status_code"), 403)
 
 
+class TestPaymentMovementTotals(TestPaymentCompany):
+	"""Phase 02 increment 7: movement_totals/approved_totals alongside the
+	pre-existing (unchanged) approved-only `totals`."""
+
+	def _get_payments(self, **kw):
+		_set_get_request()
+		return payment_api.list_collection_payments(**kw)
+
+	def _create_payment_as_admin(self, **overrides) -> dict:
+		frappe.defaults.set_user_default("company", self.company)
+		body = self._payment_body()
+		body["detail"].update(overrides)
+		return _expect_success(self._create_payment(body), "create_collection_payment")
+
+	def test_pending_and_approved_are_both_included_in_movement_totals(self):
+		today_str = frappe.utils.today()
+		pending = self._create_payment_as_admin(payment_type="Receive", amount=40)
+		approved = self._create_payment_as_admin(payment_type="Receive", amount=25)
+		self._force_status(approved["name"], "Approved")
+
+		resp = _expect_success(
+			self._get_payments(from_date=today_str, to_date=today_str, company=self.company, page_size=10),
+			"list_collection_payments",
+		)
+		movement = resp["summary"]["movement_totals"]
+		self.assertEqual(movement["basis"], "active_recorded_movements")
+		self.assertGreaterEqual(movement["inflow"], 65)  # pending's 40 + approved's 25
+
+	def test_rejected_and_cancelled_are_excluded_from_movement_totals(self):
+		today_str = frappe.utils.today()
+		before = _expect_success(
+			self._get_payments(from_date=today_str, to_date=today_str, company=self.company, page_size=10),
+			"list_collection_payments (before)",
+		)
+		rejected = self._create_payment_as_admin(payment_type="Receive", amount=999999)
+		self._force_status(rejected["name"], "Rejected")
+
+		after = _expect_success(
+			self._get_payments(from_date=today_str, to_date=today_str, company=self.company, page_size=10),
+			"list_collection_payments (after)",
+		)
+		self.assertEqual(after["summary"]["movement_totals"], before["summary"]["movement_totals"])
+
+	def test_pay_and_receive_direction_in_movement_totals(self):
+		today_str = frappe.utils.today()
+		before = _expect_success(
+			self._get_payments(from_date=today_str, to_date=today_str, company=self.company, page_size=10),
+			"list_collection_payments (before)",
+		)
+		self._create_payment_as_admin(payment_type="Pay", amount=15)
+		self._create_payment_as_admin(payment_type="Receive", amount=35)
+
+		after = _expect_success(
+			self._get_payments(from_date=today_str, to_date=today_str, company=self.company, page_size=10),
+			"list_collection_payments (after)",
+		)
+		before_m, after_m = before["summary"]["movement_totals"], after["summary"]["movement_totals"]
+		self.assertAlmostEqual(after_m.get("outflow", 0) - before_m.get("outflow", 0), 15)
+		self.assertAlmostEqual(after_m.get("inflow", 0) - before_m.get("inflow", 0), 35)
+
+	def test_movement_totals_respect_status_search_company_and_party_filters(self):
+		today_str = frappe.utils.today()
+		mine = self._create_payment_as_admin(
+			party_type="Customer", party=self.customer, payment_type="Receive", amount=44
+		)
+		self._force_status(mine["name"], "Approved")
+
+		resp = _expect_success(
+			self._get_payments(
+				from_date=today_str,
+				to_date=today_str,
+				company=self.company,
+				party_type="Customer",
+				party=self.customer,
+				status="approved",
+				page_size=10,
+			),
+			"list_collection_payments (filtered)",
+		)
+		self.assertGreaterEqual(resp["summary"]["movement_totals"]["inflow"], 44)
+		self.assertGreaterEqual(resp["summary"]["approved_totals"]["inflow"], 44)
+
+
+class TestPaymentDetailsUpdateDelete(TestPaymentCompany):
+	"""Phase 02 increment 7: get_collection_payment_details /
+	update_collection_payment / delete_collection_payment."""
+
+	def _create_payment_as_admin(self, **overrides) -> dict:
+		frappe.defaults.set_user_default("company", self.company)
+		body = self._payment_body()
+		body["detail"].update(overrides)
+		return _expect_success(self._create_payment(body), "create_collection_payment")
+
+	def _get_details(self, name: str):
+		_set_get_request()
+		return payment_api.get_collection_payment_details(name=name)
+
+	def _update(self, name: str, **kw) -> dict:
+		body = {"name": name, **kw}
+		_set_post_body(body)
+		resp = payment_api.update_collection_payment(name=name)
+		if resp.get("success"):
+			self.track_log("payment.update", kw.get("client_request_id"))
+		return resp
+
+	def _delete(self, name: str, client_request_id: str | None = None) -> dict:
+		body = {"name": name}
+		if client_request_id is not None:
+			body["client_request_id"] = client_request_id
+		_set_post_body(body)
+		resp = payment_api.delete_collection_payment(name=name)
+		if resp.get("success"):
+			self.track_log("payment.delete", client_request_id)
+		return resp
+
+	def test_get_details_returns_canonical_data_and_permissions(self):
+		created = self._create_payment_as_admin()
+		resp = _expect_success(self._get_details(created["name"]), "get_collection_payment_details")
+		self.assertEqual(resp["name"], created["name"])
+		self.assertEqual(resp["party"], self.customer)
+		self.assertIn("modified", resp)
+		self.assertTrue(resp["permissions"]["read"])
+		self.assertTrue(resp["permissions"]["update"])  # freshly created -> pending -> editable
+		self.assertTrue(resp["permissions"]["delete"])
+		self.assertFalse(resp["permissions"]["locked"])
+
+	def test_cross_user_get_details_is_403_not_404(self):
+		created = self._create_payment_as_admin()
+		frappe.set_user(self.other_user)
+		try:
+			resp = self._get_details(created["name"])
+		finally:
+			frappe.set_user("Administrator")
+		self.assertFalse(resp["success"])
+		self.assertEqual(resp["error"]["code"], "permission_denied")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 403)
+
+	def test_successful_update_changes_fields_and_returns_confirmed_state(self):
+		created = self._create_payment_as_admin(amount=10)
+		resp = _expect_success(
+			self._update(
+				created["name"],
+				base_modified=created["modified"],
+				client_request_id=str(uuid.uuid4()),
+				detail={
+					"payment_type": "Receive",
+					"party_type": "Customer",
+					"party": self.customer,
+					"party_name": self.customer,
+					"amount": 77,
+				},
+			),
+			"update_collection_payment",
+		)
+		self.assertEqual(resp["amount"], 77)
+		confirmed = _expect_success(self._get_details(created["name"]), "get_collection_payment_details")
+		self.assertEqual(confirmed["amount"], 77)
+
+	def test_update_recomputes_party_name_server_side(self):
+		created = self._create_payment_as_admin()
+		fabricated = f"NOT-THE-REAL-NAME-{uuid.uuid4().hex[:8]}"
+		resp = _expect_success(
+			self._update(
+				created["name"],
+				base_modified=created["modified"],
+				client_request_id=str(uuid.uuid4()),
+				detail={
+					"payment_type": "Receive",
+					"party_type": "Customer",
+					"party": self.customer,
+					"party_name": fabricated,  # must be ignored
+					"amount": 12,
+				},
+			),
+			"update_collection_payment",
+		)
+		self.assertNotEqual(resp["party_name"], fabricated)
+
+	def test_stale_base_modified_on_update_returns_409_with_current_state(self):
+		created = self._create_payment_as_admin()
+		resp = self._update(
+			created["name"],
+			base_modified="1999-01-01 00:00:00.000000",
+			client_request_id=str(uuid.uuid4()),
+			posting_date=frappe.utils.today(),
+		)
+		self.assertFalse(resp["success"], f"expected a 409 conflict, got:\n{_dump(resp)}")
+		self.assertEqual(resp["error"]["code"], "conflict")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 409)
+		self.assertIn("name", resp["data"], "409 body must carry the current server state")
+
+	def test_update_replay_returns_same_result_and_conflicting_payload_is_409(self):
+		created = self._create_payment_as_admin()
+		key = str(uuid.uuid4())
+		first = _expect_success(
+			self._update(created["name"], base_modified=created["modified"], client_request_id=key, posting_date=frappe.utils.today()),
+			"update_collection_payment",
+		)
+		replay = _expect_success(
+			self._update(created["name"], base_modified=created["modified"], client_request_id=key, posting_date=frappe.utils.today()),
+			"update_collection_payment (replay)",
+		)
+		self.assertEqual(replay["modified"], first["modified"])
+
+		conflict = self._update(
+			created["name"], base_modified=created["modified"], client_request_id=key, posting_date=frappe.utils.add_days(frappe.utils.today(), -1)
+		)
+		self.assertFalse(conflict["success"])
+		self.assertEqual(conflict["error"]["code"], "idempotency_conflict")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 409)
+
+	def test_unauthorized_user_update_and_delete_are_403(self):
+		created = self._create_payment_as_admin()
+		frappe.set_user(self.other_user)
+		try:
+			update_resp = self._update(created["name"], client_request_id=str(uuid.uuid4()), posting_date=frappe.utils.today())
+			delete_resp = self._delete(created["name"], client_request_id=str(uuid.uuid4()))
+		finally:
+			frappe.set_user("Administrator")
+		for resp in (update_resp, delete_resp):
+			self.assertFalse(resp["success"])
+			self.assertEqual(resp["error"]["code"], "permission_denied")
+			self.assertEqual(frappe.local.response.get("http_status_code"), 403)
+
+	def test_approved_payment_cannot_be_updated_or_deleted(self):
+		created = self._create_payment_as_admin()
+		self._force_status(created["name"], "Approved")
+
+		update_resp = self._update(
+			created["name"], client_request_id=str(uuid.uuid4()), posting_date=frappe.utils.today()
+		)
+		self.assertFalse(update_resp["success"])
+		self.assertEqual(update_resp["error"]["code"], "validation_error")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 422)
+
+		delete_resp = self._delete(created["name"], client_request_id=str(uuid.uuid4()))
+		self.assertFalse(delete_resp["success"])
+		self.assertEqual(delete_resp["error"]["code"], "validation_error")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 422)
+
+		details = _expect_success(self._get_details(created["name"]), "get_collection_payment_details")
+		self.assertTrue(details["permissions"]["locked"])
+
+	def test_delete_replay_is_success_but_a_fresh_id_on_a_gone_doc_is_404(self):
+		created = self._create_payment_as_admin()
+		key = str(uuid.uuid4())
+
+		first = _expect_success(self._delete(created["name"], client_request_id=key), "delete_collection_payment")
+		self.assertTrue(first["deleted"])
+
+		replay = _expect_success(
+			self._delete(created["name"], client_request_id=key), "delete_collection_payment (replay)"
+		)
+		self.assertTrue(replay["deleted"], "replay of the deleting request id must not 404")
+
+		other = self._delete(created["name"], client_request_id=str(uuid.uuid4()))
+		self.assertFalse(other["success"])
+		self.assertEqual(other["error"]["code"], "not_found")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 404)
+
+	def test_cross_user_update_and_delete_are_403_not_a_leak(self):
+		created = self._create_payment_as_admin()
+		frappe.set_user(self.other_user)
+		try:
+			details_resp = self._get_details(created["name"])
+			update_resp = self._update(created["name"], client_request_id=str(uuid.uuid4()), posting_date=frappe.utils.today())
+			delete_resp = self._delete(created["name"], client_request_id=str(uuid.uuid4()))
+		finally:
+			frappe.set_user("Administrator")
+		for resp in (details_resp, update_resp, delete_resp):
+			self.assertFalse(resp["success"])
+			self.assertEqual(resp["error"]["code"], "permission_denied")
+			self.assertEqual(frappe.local.response.get("http_status_code"), 403)
+		# The payment must still exist and be untouched -- confirmed as Administrator.
+		still_there = _expect_success(self._get_details(created["name"]), "get_collection_payment_details")
+		self.assertEqual(still_there["name"], created["name"])
+
+
 # --------------------------------------------------------------------------- #
 #  operation status / envelope                                               #
 # --------------------------------------------------------------------------- #

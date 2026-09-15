@@ -675,6 +675,9 @@ PUBLIC_ENDPOINTS_EXPECTED_ENVELOPE: dict[object, list[str]] = {
 		"list_mode_of_payments",
 		"get_party_references",
 		"get_today_cashflow",
+		"get_collection_payment_details",
+		"update_collection_payment",
+		"delete_collection_payment",
 	],
 	user: [
 		"get_user_default_company",
@@ -1012,6 +1015,140 @@ def test_list_collection_payments_combines_a_single_currency_into_one_total(monk
 	summary = resp["data"]["summary"]
 	assert summary["totals"] == {"inflow": 100.0, "outflow": 30.0, "net": 70.0, "basis": "approved"}
 	assert "totals_by_currency" not in summary  # no currency field on this site -- nothing to group
+	# No active status filter -- both approved rows count toward movement_totals
+	# too (there's no pending row in this fixture, so the two figures match).
+	assert summary["movement_totals"] == {
+		"inflow": 100.0, "outflow": 30.0, "net": 70.0, "basis": "active_recorded_movements"
+	}
+	assert summary["approved_totals"] == {"inflow": 100.0, "outflow": 30.0, "net": 70.0, "basis": "approved"}
+
+
+def test_movement_and_approved_totals_respect_the_active_status_filter_unlike_legacy_totals(monkeypatch):
+	"""`totals` (legacy, backward-compat) is base_filters-scoped and must stay
+	blind to the active status filter; `movement_totals`/`approved_totals`
+	(new) are `filters`-scoped and must respect it."""
+	runtime = fake_frappe()
+	runtime.local.request = SimpleNamespace(method="GET", headers={})
+
+	class FakeMeta:
+		def has_field(self, name):
+			return False
+
+	runtime.get_meta = lambda dt: FakeMeta()
+
+	all_parents = [
+		{"name": "CP-1", "status": "Pending", "docstatus": 0},
+		{"name": "CP-2", "status": "Approved", "docstatus": 1},
+	]
+	child_rows_by_parent = {
+		"CP-1": [{"parent": "CP-1", "payment_type": "Receive", "amount": 50}],
+		"CP-2": [{"parent": "CP-2", "payment_type": "Pay", "amount": 20}],
+	}
+
+	def _has_status_condition(filters):
+		return any(isinstance(f, list) and f and f[0] == "status" for f in filters)
+
+	def fake_get_list(doctype, **kwargs):
+		fields = kwargs.get("fields") or []
+		filters = kwargs.get("filters") or []
+		if "status" in fields and "docstatus" in fields:
+			if _has_status_condition(filters):
+				return [p for p in all_parents if p["status"] == "Pending"]
+			return list(all_parents)
+		return []
+
+	def fake_get_all(doctype, **kwargs):
+		filters = kwargs.get("filters") or {}
+		parent_in = filters.get("parent", (None, []))[1]
+		return [r for name in parent_in for r in child_rows_by_parent.get(name, [])]
+
+	runtime.get_list = fake_get_list
+	runtime.get_all = fake_get_all
+	_patch(monkeypatch, payment, runtime)
+	_patch(monkeypatch, security, runtime)
+	_patch(monkeypatch, _dates, runtime)
+	monkeypatch.setattr(payment, "set_cors_headers", lambda methods: None)
+	monkeypatch.setattr(payment, "require_authenticated_user", lambda: "user@example.com")
+	monkeypatch.setattr(payment, "require_doctype_permission", lambda *a, **k: None)
+
+	resp = payment.list_collection_payments(from_date="2026-01-01", to_date="2026-01-01", status="pending")
+	summary = resp["data"]["summary"]
+
+	# Legacy totals: still the whole base_filters scope (both rows), unaffected
+	# by status=pending -- backward compatible.
+	assert summary["totals"] == {"inflow": 0.0, "outflow": 20.0, "net": -20.0, "basis": "approved"}
+	# New totals: scoped to `filters` (status=pending applied) -- only CP-1.
+	assert summary["movement_totals"] == {
+		"inflow": 50.0, "outflow": 0.0, "net": 50.0, "basis": "active_recorded_movements"
+	}
+	assert summary["approved_totals"] == {"inflow": 0.0, "outflow": 0.0, "net": 0.0, "basis": "approved"}
+
+
+def test_movement_totals_excludes_rejected_and_cancelled(monkeypatch):
+	runtime = fake_frappe()
+	runtime.local.request = SimpleNamespace(method="GET", headers={})
+
+	class FakeMeta:
+		def has_field(self, name):
+			return False
+
+	runtime.get_meta = lambda dt: FakeMeta()
+
+	all_parents = [
+		{"name": "CP-1", "status": "Pending", "docstatus": 0},
+		{"name": "CP-2", "status": "Rejected", "docstatus": 0},
+	]
+	child_rows_by_parent = {
+		"CP-1": [{"parent": "CP-1", "payment_type": "Receive", "amount": 50}],
+		"CP-2": [{"parent": "CP-2", "payment_type": "Receive", "amount": 999999}],  # must never count
+	}
+
+	def fake_get_list(doctype, **kwargs):
+		fields = kwargs.get("fields") or []
+		if "status" in fields and "docstatus" in fields:
+			return list(all_parents)
+		return []
+
+	def fake_get_all(doctype, **kwargs):
+		filters = kwargs.get("filters") or {}
+		parent_in = filters.get("parent", (None, []))[1]
+		return [r for name in parent_in for r in child_rows_by_parent.get(name, [])]
+
+	runtime.get_list = fake_get_list
+	runtime.get_all = fake_get_all
+	_patch(monkeypatch, payment, runtime)
+	_patch(monkeypatch, security, runtime)
+	_patch(monkeypatch, _dates, runtime)
+	monkeypatch.setattr(payment, "set_cors_headers", lambda methods: None)
+	monkeypatch.setattr(payment, "require_authenticated_user", lambda: "user@example.com")
+	monkeypatch.setattr(payment, "require_doctype_permission", lambda *a, **k: None)
+
+	resp = payment.list_collection_payments(from_date="2026-01-01", to_date="2026-01-01")
+	summary = resp["data"]["summary"]
+	assert summary["movement_totals"] == {
+		"inflow": 50.0, "outflow": 0.0, "net": 50.0, "basis": "active_recorded_movements"
+	}
+
+
+# --------------------------------------------------------------------------- #
+#  editable-state rule (get/update/delete_collection_payment)                #
+# --------------------------------------------------------------------------- #
+
+
+def test_payment_is_editable_only_while_pending_and_not_cancelled():
+	pending = SimpleNamespace(docstatus=0, status="Pending")
+	blank = SimpleNamespace(docstatus=0, status="")
+	approved = SimpleNamespace(docstatus=0, status="Approved")
+	paid = SimpleNamespace(docstatus=1, status="Paid")
+	rejected = SimpleNamespace(docstatus=0, status="Rejected")
+	cancelled_pending = SimpleNamespace(docstatus=2, status="Pending")
+
+	assert payment._payment_is_editable(pending) is True
+	assert payment._payment_is_editable(blank) is True  # blank -> pending bucket
+	assert payment._payment_is_editable(approved) is False
+	assert payment._payment_is_editable(paid) is False
+	assert payment._payment_is_editable(rejected) is False
+	assert payment._payment_is_editable(cancelled_pending) is False
 
 
 # --------------------------------------------------------------------------- #
