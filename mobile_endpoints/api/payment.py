@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from typing import Any
 
 import frappe
@@ -322,11 +323,20 @@ def list_collection_payments(
 	meta = frappe.get_meta("Collection and Payment")
 	has_currency_field = meta.has_field("currency")
 
+	# Doctype-level write/delete permission, evaluated ONCE for this user. Per
+	# row it is combined with that row's own editable state below. The rows
+	# themselves already come from a permission-aware frappe.get_list(), so
+	# document-level read is established; update/delete remain authoritatively
+	# re-checked per document by update_/delete_collection_payment (which call
+	# doc.has_permission()), so these are UI hints, never the gate.
+	can_write_doctype = bool(frappe.has_permission("Collection and Payment", "write"))
+	can_delete_doctype = bool(frappe.has_permission("Collection and Payment", "delete"))
+
 	parents = frappe.get_list(
 		"Collection and Payment",
 		filters=filters,
 		or_filters=or_filters,
-		fields=["name", "posting_date", "company", "owner", "creation", "status"],
+		fields=["name", "posting_date", "company", "owner", "creation", "status", "docstatus"],
 		order_by="creation desc",
 		limit_start=start,
 		limit_page_length=page_size + 1,
@@ -365,12 +375,21 @@ def list_collection_payments(
 		row = first_row_map.get(parent["name"])
 		if not row:
 			continue
+		row_editable = _payment_is_editable(
+			SimpleNamespace(docstatus=parent.get("docstatus", 0), status=parent.get("status"))
+		)
 		results.append(
 			{
 				"name": parent["name"],
 				"posting_date": parent["posting_date"],
 				"company": parent["company"],
 				"status": parent.get("status"),
+				"permissions": {
+					"read": True,  # it came out of a permission-aware get_list
+					"update": row_editable and can_write_doctype,
+					"delete": row_editable and can_delete_doctype,
+					"locked": not row_editable,
+				},
 				"payment_type": row["payment_type"],
 				"party_type": row["party_type"],
 				"party": row["party"],

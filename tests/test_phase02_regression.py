@@ -935,7 +935,7 @@ def test_list_collection_payments_summary_is_approved_only_and_currency_grouped(
 
 	def fake_get_list(doctype, **kwargs):
 		fields = kwargs.get("fields") or []
-		if "status" in fields and "docstatus" in fields:
+		if "status" in fields and "docstatus" in fields and "posting_date" not in fields:
 			return list(summary_parents)
 		return []  # the paginated rows query -- not under test here
 
@@ -992,7 +992,7 @@ def test_list_collection_payments_combines_a_single_currency_into_one_total(monk
 
 	def fake_get_list(doctype, **kwargs):
 		fields = kwargs.get("fields") or []
-		if "status" in fields and "docstatus" in fields:
+		if "status" in fields and "docstatus" in fields and "posting_date" not in fields:
 			return list(summary_parents)
 		return []
 
@@ -1051,7 +1051,7 @@ def test_movement_and_approved_totals_respect_the_active_status_filter_unlike_le
 	def fake_get_list(doctype, **kwargs):
 		fields = kwargs.get("fields") or []
 		filters = kwargs.get("filters") or []
-		if "status" in fields and "docstatus" in fields:
+		if "status" in fields and "docstatus" in fields and "posting_date" not in fields:
 			if _has_status_condition(filters):
 				return [p for p in all_parents if p["status"] == "Pending"]
 			return list(all_parents)
@@ -1105,7 +1105,7 @@ def test_movement_totals_excludes_rejected_and_cancelled(monkeypatch):
 
 	def fake_get_list(doctype, **kwargs):
 		fields = kwargs.get("fields") or []
-		if "status" in fields and "docstatus" in fields:
+		if "status" in fields and "docstatus" in fields and "posting_date" not in fields:
 			return list(all_parents)
 		return []
 
@@ -1133,6 +1133,106 @@ def test_movement_totals_excludes_rejected_and_cancelled(monkeypatch):
 # --------------------------------------------------------------------------- #
 #  editable-state rule (get/update/delete_collection_payment)                #
 # --------------------------------------------------------------------------- #
+
+
+def test_list_rows_carry_server_calculated_permissions(monkeypatch):
+	"""The Transactions list needs to know which rows offer an edit action —
+	that decision is made HERE (editable state + this user's doctype
+	permission), never inferred from `status` on the client."""
+	runtime = fake_frappe()
+	runtime.local.request = SimpleNamespace(method="GET", headers={})
+
+	class FakeMeta:
+		def has_field(self, name):
+			return False
+
+	runtime.get_meta = lambda dt: FakeMeta()
+
+	rows = [
+		{
+			"name": "CP-1", "posting_date": "2026-01-01", "company": "Acme",
+			"owner": "u", "creation": "x", "status": "Pending", "docstatus": 0,
+		},
+		{
+			"name": "CP-2", "posting_date": "2026-01-01", "company": "Acme",
+			"owner": "u", "creation": "x", "status": "Approved", "docstatus": 0,
+		},
+	]
+	child = {
+		"CP-1": [{"parent": "CP-1", "payment_type": "Receive", "amount": 10, "party_type": "Customer",
+			"party": "C1", "party_name": "C1", "mode_of_payment": "Cash", "description": ""}],
+		"CP-2": [{"parent": "CP-2", "payment_type": "Pay", "amount": 20, "party_type": "Customer",
+			"party": "C1", "party_name": "C1", "mode_of_payment": "Cash", "description": ""}],
+	}
+
+	def fake_get_list(doctype, **kwargs):
+		fields = kwargs.get("fields") or []
+		if "posting_date" in fields:
+			return list(rows)
+		return []
+
+	def fake_get_all(doctype, **kwargs):
+		filters = kwargs.get("filters") or {}
+		parent_in = filters.get("parent", (None, []))[1]
+		return [r for name in parent_in for r in child.get(name, [])]
+
+	runtime.get_list = fake_get_list
+	runtime.get_all = fake_get_all
+	_patch(monkeypatch, payment, runtime)
+	_patch(monkeypatch, security, runtime)
+	_patch(monkeypatch, _dates, runtime)
+	monkeypatch.setattr(payment, "set_cors_headers", lambda methods: None)
+	monkeypatch.setattr(payment, "require_authenticated_user", lambda: "user@example.com")
+	monkeypatch.setattr(payment, "require_doctype_permission", lambda *a, **k: None)
+
+	resp = payment.list_collection_payments(from_date="2026-01-01", to_date="2026-01-01")
+	by_name = {p["name"]: p for p in resp["data"]["payments"]}
+
+	# Pending -> editable (this fake user has doctype write/delete).
+	assert by_name["CP-1"]["permissions"] == {
+		"read": True, "update": True, "delete": True, "locked": False
+	}
+	# Approved -> locked for edit/delete regardless of doctype permission.
+	assert by_name["CP-2"]["permissions"] == {
+		"read": True, "update": False, "delete": False, "locked": True
+	}
+
+
+def test_list_row_permissions_follow_the_users_doctype_permission(monkeypatch):
+	"""A user without write/delete on the doctype gets no edit/delete hint,
+	even on a pending row."""
+	runtime = fake_frappe()
+	runtime.local.request = SimpleNamespace(method="GET", headers={})
+	runtime.has_permission = lambda *a, **k: False
+
+	class FakeMeta:
+		def has_field(self, name):
+			return False
+
+	runtime.get_meta = lambda dt: FakeMeta()
+	rows = [{
+		"name": "CP-1", "posting_date": "2026-01-01", "company": "Acme",
+		"owner": "u", "creation": "x", "status": "Pending", "docstatus": 0,
+	}]
+	child = {"CP-1": [{"parent": "CP-1", "payment_type": "Receive", "amount": 10,
+		"party_type": "Customer", "party": "C1", "party_name": "C1",
+		"mode_of_payment": "Cash", "description": ""}]}
+
+	runtime.get_list = lambda dt, **kw: (list(rows) if "posting_date" in (kw.get("fields") or []) else [])
+	runtime.get_all = lambda dt, **kw: [
+		r for name in (kw.get("filters") or {}).get("parent", (None, []))[1] for r in child.get(name, [])
+	]
+	_patch(monkeypatch, payment, runtime)
+	_patch(monkeypatch, security, runtime)
+	_patch(monkeypatch, _dates, runtime)
+	monkeypatch.setattr(payment, "set_cors_headers", lambda methods: None)
+	monkeypatch.setattr(payment, "require_authenticated_user", lambda: "user@example.com")
+	monkeypatch.setattr(payment, "require_doctype_permission", lambda *a, **k: None)
+
+	resp = payment.list_collection_payments(from_date="2026-01-01", to_date="2026-01-01")
+	perms = resp["data"]["payments"][0]["permissions"]
+	assert perms["update"] is False
+	assert perms["delete"] is False
 
 
 def test_payment_is_editable_only_while_pending_and_not_cancelled():
@@ -1232,7 +1332,15 @@ def _rows_call(calls):
 
 
 def _summary_call(calls):
-	return next(c for c in calls if c["fn"] == "get_list" and "docstatus" in (c.get("fields") or []))
+	# The rows call also selects `docstatus` now (for per-row permission
+	# hints), so the summary call is the one WITHOUT `posting_date`.
+	return next(
+		c
+		for c in calls
+		if c["fn"] == "get_list"
+		and "docstatus" in (c.get("fields") or [])
+		and "posting_date" not in (c.get("fields") or [])
+	)
 
 
 def test_search_filters_rows_and_summary_via_the_child_table_join(monkeypatch):
