@@ -1196,6 +1196,20 @@ class TestPaymentDetailsUpdateDelete(TestPaymentCompany):
 		_set_get_request()
 		return payment_api.get_collection_payment_details(name=name)
 
+	def _full_detail(self, **overrides) -> dict:
+		"""`detail` is a COMPLETE replacement on update -- every mandatory field
+		(mode_of_payment included) must be sent every time."""
+		detail = {
+			"payment_type": "Receive",
+			"party_type": "Customer",
+			"party": self.customer,
+			"amount": 10,
+			"mode_of_payment": self.mode_of_payment,
+			"description": "",
+		}
+		detail.update(overrides)
+		return detail
+
 	def _update(self, name: str, **kw) -> dict:
 		body = {"name": name, **kw}
 		_set_post_body(body)
@@ -1243,19 +1257,15 @@ class TestPaymentDetailsUpdateDelete(TestPaymentCompany):
 				created["name"],
 				base_modified=created["modified"],
 				client_request_id=str(uuid.uuid4()),
-				detail={
-					"payment_type": "Receive",
-					"party_type": "Customer",
-					"party": self.customer,
-					"party_name": self.customer,
-					"amount": 77,
-				},
+				detail=self._full_detail(amount=77),
 			),
 			"update_collection_payment",
 		)
 		self.assertEqual(resp["amount"], 77)
+		self.assertEqual(resp["mode_of_payment"], self.mode_of_payment)
 		confirmed = _expect_success(self._get_details(created["name"]), "get_collection_payment_details")
 		self.assertEqual(confirmed["amount"], 77)
+		self.assertEqual(confirmed["mode_of_payment"], self.mode_of_payment)
 
 	def test_update_recomputes_party_name_server_side(self):
 		created = self._create_payment_as_admin()
@@ -1265,13 +1275,7 @@ class TestPaymentDetailsUpdateDelete(TestPaymentCompany):
 				created["name"],
 				base_modified=created["modified"],
 				client_request_id=str(uuid.uuid4()),
-				detail={
-					"payment_type": "Receive",
-					"party_type": "Customer",
-					"party": self.customer,
-					"party_name": fabricated,  # must be ignored
-					"amount": 12,
-				},
+				detail=self._full_detail(amount=12, party_name=fabricated),  # party_name must be ignored
 			),
 			"update_collection_payment",
 		)
@@ -1284,6 +1288,7 @@ class TestPaymentDetailsUpdateDelete(TestPaymentCompany):
 			base_modified="1999-01-01 00:00:00.000000",
 			client_request_id=str(uuid.uuid4()),
 			posting_date=frappe.utils.today(),
+			detail=self._full_detail(),
 		)
 		self.assertFalse(resp["success"], f"expected a 409 conflict, got:\n{_dump(resp)}")
 		self.assertEqual(resp["error"]["code"], "conflict")
@@ -1294,17 +1299,33 @@ class TestPaymentDetailsUpdateDelete(TestPaymentCompany):
 		created = self._create_payment_as_admin()
 		key = str(uuid.uuid4())
 		first = _expect_success(
-			self._update(created["name"], base_modified=created["modified"], client_request_id=key, posting_date=frappe.utils.today()),
+			self._update(
+				created["name"],
+				base_modified=created["modified"],
+				client_request_id=key,
+				posting_date=frappe.utils.today(),
+				detail=self._full_detail(),
+			),
 			"update_collection_payment",
 		)
 		replay = _expect_success(
-			self._update(created["name"], base_modified=created["modified"], client_request_id=key, posting_date=frappe.utils.today()),
+			self._update(
+				created["name"],
+				base_modified=created["modified"],
+				client_request_id=key,
+				posting_date=frappe.utils.today(),
+				detail=self._full_detail(),
+			),
 			"update_collection_payment (replay)",
 		)
 		self.assertEqual(replay["modified"], first["modified"])
 
 		conflict = self._update(
-			created["name"], base_modified=created["modified"], client_request_id=key, posting_date=frappe.utils.add_days(frappe.utils.today(), -1)
+			created["name"],
+			base_modified=created["modified"],
+			client_request_id=key,
+			posting_date=frappe.utils.add_days(frappe.utils.today(), -1),
+			detail=self._full_detail(),
 		)
 		self.assertFalse(conflict["success"])
 		self.assertEqual(conflict["error"]["code"], "idempotency_conflict")
@@ -1314,7 +1335,12 @@ class TestPaymentDetailsUpdateDelete(TestPaymentCompany):
 		created = self._create_payment_as_admin()
 		frappe.set_user(self.other_user)
 		try:
-			update_resp = self._update(created["name"], client_request_id=str(uuid.uuid4()), posting_date=frappe.utils.today())
+			update_resp = self._update(
+				created["name"],
+				client_request_id=str(uuid.uuid4()),
+				posting_date=frappe.utils.today(),
+				detail=self._full_detail(),
+			)
 			delete_resp = self._delete(created["name"], client_request_id=str(uuid.uuid4()))
 		finally:
 			frappe.set_user("Administrator")
@@ -1328,7 +1354,10 @@ class TestPaymentDetailsUpdateDelete(TestPaymentCompany):
 		self._force_status(created["name"], "Approved")
 
 		update_resp = self._update(
-			created["name"], client_request_id=str(uuid.uuid4()), posting_date=frappe.utils.today()
+			created["name"],
+			client_request_id=str(uuid.uuid4()),
+			posting_date=frappe.utils.today(),
+			detail=self._full_detail(),
 		)
 		self.assertFalse(update_resp["success"])
 		self.assertEqual(update_resp["error"]["code"], "validation_error")
@@ -1364,7 +1393,12 @@ class TestPaymentDetailsUpdateDelete(TestPaymentCompany):
 		frappe.set_user(self.other_user)
 		try:
 			details_resp = self._get_details(created["name"])
-			update_resp = self._update(created["name"], client_request_id=str(uuid.uuid4()), posting_date=frappe.utils.today())
+			update_resp = self._update(
+				created["name"],
+				client_request_id=str(uuid.uuid4()),
+				posting_date=frappe.utils.today(),
+				detail=self._full_detail(),
+			)
 			delete_resp = self._delete(created["name"], client_request_id=str(uuid.uuid4()))
 		finally:
 			frappe.set_user("Administrator")
@@ -1375,6 +1409,211 @@ class TestPaymentDetailsUpdateDelete(TestPaymentCompany):
 		# The payment must still exist and be untouched -- confirmed as Administrator.
 		still_there = _expect_success(self._get_details(created["name"]), "get_collection_payment_details")
 		self.assertEqual(still_there["name"], created["name"])
+
+
+class TestPaymentModeOfPaymentContract(TestPaymentCompany):
+	"""`mode_of_payment` is mandatory on the live "Collection and Payment
+	Details" DocType, so it is mandatory in this API's contract too -- for
+	create AND update. Before this, omitting it turned into a DocType-level
+	save error ("Row #1: Value missing for: Mode of Payment") instead of a
+	clean 422."""
+
+	def _get_details(self, name: str):
+		_set_get_request()
+		return payment_api.get_collection_payment_details(name=name)
+
+	def _full_detail(self, **overrides) -> dict:
+		detail = {
+			"payment_type": "Receive",
+			"party_type": "Customer",
+			"party": self.customer,
+			"amount": 10,
+			"mode_of_payment": self.mode_of_payment,
+			"description": "",
+		}
+		detail.update(overrides)
+		return detail
+
+	def _create_payment_as_admin(self, **overrides) -> dict:
+		frappe.defaults.set_user_default("company", self.company)
+		body = self._payment_body()
+		body["detail"].update(overrides)
+		return _expect_success(self._create_payment(body), "create_collection_payment")
+
+	def _update(self, name: str, **kw) -> dict:
+		body = {"name": name, **kw}
+		_set_post_body(body)
+		resp = payment_api.update_collection_payment(name=name)
+		if resp.get("success"):
+			self.track_log("payment.update", kw.get("client_request_id"))
+		return resp
+
+	@staticmethod
+	def _log_status(scope: str, client_request_id: str):
+		return frappe.db.get_value(
+			LOG_DOCTYPE, _composite(frappe.session.user, scope, client_request_id), "status"
+		)
+
+	def test_create_without_mode_of_payment_is_422_and_creates_nothing(self):
+		frappe.defaults.set_user_default("company", self.company)
+		before = frappe.db.count("Collection and Payment")
+
+		body = self._payment_body()
+		body["detail"].pop("mode_of_payment", None)
+		resp = self._create_payment(body)
+
+		self.assertFalse(resp["success"], f"expected a 422, got:\n{_dump(resp)}")
+		self.assertEqual(resp["error"]["code"], "validation_error")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 422)
+		# Names the field so the client can show it inline at that input.
+		self.assertIn("mode_of_payment", resp["error"]["fields"])
+		self.assertEqual(frappe.db.count("Collection and Payment"), before, "nothing may be created")
+
+	def test_create_with_a_blank_mode_of_payment_is_also_422(self):
+		frappe.defaults.set_user_default("company", self.company)
+		body = self._payment_body()
+		body["detail"]["mode_of_payment"] = ""
+		resp = self._create_payment(body)
+		self.assertFalse(resp["success"])
+		self.assertEqual(resp["error"]["code"], "validation_error")
+
+	def test_create_with_an_unknown_mode_of_payment_is_422(self):
+		frappe.defaults.set_user_default("company", self.company)
+		body = self._payment_body()
+		body["detail"]["mode_of_payment"] = f"{TEST_PREFIX}-NO-SUCH-MODE-{uuid.uuid4().hex[:8]}"
+		resp = self._create_payment(body)
+		self.assertFalse(resp["success"])
+		self.assertEqual(resp["error"]["code"], "validation_error")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 422)
+
+	def test_update_without_mode_of_payment_is_422_and_leaves_the_payment_untouched(self):
+		created = self._create_payment_as_admin(amount=10)
+		before = _expect_success(self._get_details(created["name"]), "get_collection_payment_details")
+
+		detail = self._full_detail(amount=99)
+		detail.pop("mode_of_payment")
+		resp = self._update(
+			created["name"],
+			base_modified=created["modified"],
+			client_request_id=str(uuid.uuid4()),
+			detail=detail,
+		)
+
+		self.assertFalse(resp["success"], f"expected a 422, got:\n{_dump(resp)}")
+		self.assertEqual(resp["error"]["code"], "validation_error")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 422)
+		self.assertIn("mode_of_payment", resp["error"]["fields"])
+
+		after = _expect_success(self._get_details(created["name"]), "get_collection_payment_details")
+		self.assertEqual(after["amount"], before["amount"], "a rejected update must change nothing")
+		self.assertEqual(after["mode_of_payment"], before["mode_of_payment"])
+		self.assertEqual(after["modified"], before["modified"])
+
+	def test_update_with_an_unknown_mode_of_payment_is_422(self):
+		created = self._create_payment_as_admin()
+		resp = self._update(
+			created["name"],
+			base_modified=created["modified"],
+			client_request_id=str(uuid.uuid4()),
+			detail=self._full_detail(
+				mode_of_payment=f"{TEST_PREFIX}-NO-SUCH-MODE-{uuid.uuid4().hex[:8]}"
+			),
+		)
+		self.assertFalse(resp["success"])
+		self.assertEqual(resp["error"]["code"], "validation_error")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 422)
+
+	def test_update_with_a_valid_mode_of_payment_succeeds_and_persists_it(self):
+		created = self._create_payment_as_admin(amount=10)
+		resp = _expect_success(
+			self._update(
+				created["name"],
+				base_modified=created["modified"],
+				client_request_id=str(uuid.uuid4()),
+				detail=self._full_detail(amount=55),
+			),
+			"update_collection_payment",
+		)
+		self.assertEqual(resp["mode_of_payment"], self.mode_of_payment)
+		confirmed = _expect_success(self._get_details(created["name"]), "get_collection_payment_details")
+		self.assertEqual(confirmed["mode_of_payment"], self.mode_of_payment)
+		self.assertEqual(confirmed["amount"], 55)
+
+	def test_a_rejected_update_leaves_no_processing_or_done_request_log(self):
+		"""run_idempotent reserves the key, then rolls the whole transaction
+		back on failure -- a 422 must not strand a `processing` row that would
+		make an honest retry with the same key look like a duplicate."""
+		created = self._create_payment_as_admin()
+		key = str(uuid.uuid4())
+
+		detail = self._full_detail(amount=42)
+		detail.pop("mode_of_payment")
+		rejected = self._update(
+			created["name"], base_modified=created["modified"], client_request_id=key, detail=detail
+		)
+		self.assertFalse(rejected["success"])
+		self.assertIsNone(
+			self._log_status("payment.update", key), "no log row may survive a failed update"
+		)
+
+		# The very same key must now work once the payload is complete.
+		ok = _expect_success(
+			self._update(
+				created["name"],
+				base_modified=created["modified"],
+				client_request_id=key,
+				detail=self._full_detail(amount=42),
+			),
+			"update_collection_payment (same key, fixed payload)",
+		)
+		self.assertEqual(ok["amount"], 42)
+		self.assertEqual(self._log_status("payment.update", key), "done")
+
+	def test_a_rejected_create_leaves_no_request_log_row(self):
+		frappe.defaults.set_user_default("company", self.company)
+		key = str(uuid.uuid4())
+		body = self._payment_body()
+		body["client_request_id"] = key
+		body["detail"].pop("mode_of_payment", None)
+
+		rejected = self._create_payment(body)
+		self.assertFalse(rejected["success"])
+		self.assertIsNone(
+			self._log_status("payment.create", key), "no log row may survive a failed create"
+		)
+
+	def test_replay_and_base_modified_still_work_with_the_required_mode(self):
+		created = self._create_payment_as_admin(amount=10)
+		key = str(uuid.uuid4())
+		detail = self._full_detail(amount=31)
+
+		first = _expect_success(
+			self._update(
+				created["name"], base_modified=created["modified"], client_request_id=key, detail=detail
+			),
+			"update_collection_payment",
+		)
+		# A replay with the same key returns the stored result even though
+		# base_modified is now stale.
+		replay = _expect_success(
+			self._update(
+				created["name"], base_modified=created["modified"], client_request_id=key, detail=detail
+			),
+			"update_collection_payment (replay)",
+		)
+		self.assertEqual(replay["modified"], first["modified"])
+		self.assertEqual(replay["amount"], 31)
+
+		# A genuinely stale write with a FRESH key is still a 409.
+		stale = self._update(
+			created["name"],
+			base_modified="1999-01-01 00:00:00.000000",
+			client_request_id=str(uuid.uuid4()),
+			detail=self._full_detail(amount=32),
+		)
+		self.assertFalse(stale["success"])
+		self.assertEqual(stale["error"]["code"], "conflict")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 409)
 
 
 # --------------------------------------------------------------------------- #

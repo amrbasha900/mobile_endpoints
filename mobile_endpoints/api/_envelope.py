@@ -45,6 +45,15 @@ class CompanyError(frappe.ValidationError):
         self.field = field
 
 
+class FieldValidationError(frappe.ValidationError):
+    """A 422 that names the offending field, so the client can render the
+    message inline next to that input instead of as a generic toast."""
+
+    def __init__(self, message, field: str):
+        super().__init__(message)
+        self.field = field
+
+
 def request_id() -> str:
     rid = getattr(frappe.local, "mobile_request_id", None)
     if not rid:
@@ -116,6 +125,7 @@ def mobile_api(fn):
     - a plain dict return is wrapped with `ok(...)`;
     - `StaleDocumentError`  -> 409 `conflict` (with current state in `data`);
     - `CompanyError`        -> 422 `validation_error` (with `fields`);
+    - `FieldValidationError`-> 422 `validation_error` (with the named `fields`);
     - `frappe.PermissionError` -> 403 `permission_denied`;
     - `frappe.DoesNotExistError` -> 404 `not_found`;
     - `IdempotencyConflict` -> 409 `idempotency_conflict`;
@@ -146,6 +156,14 @@ def mobile_api(fn):
                 ERR_VALIDATION,
                 str(exc) or _("A company is required."),
                 fields={getattr(exc, "field", "company"): "invalid"},
+                http_status=422,
+            )
+        except FieldValidationError as exc:
+            frappe.db.rollback()
+            return fail(
+                ERR_VALIDATION,
+                _first_message(exc, message_log_start),
+                fields={getattr(exc, "field", ""): "invalid"},
                 http_status=422,
             )
         except frappe.AuthenticationError as exc:

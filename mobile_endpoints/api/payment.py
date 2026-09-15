@@ -6,7 +6,12 @@ from frappe import _
 from frappe.utils import cint, cstr, flt
 
 from mobile_endpoints.api._dates import resolve_period, site_timezone
-from mobile_endpoints.api._envelope import StaleDocumentError, mobile_api, ok
+from mobile_endpoints.api._envelope import (
+	FieldValidationError,
+	StaleDocumentError,
+	mobile_api,
+	ok,
+)
 from mobile_endpoints.api._idempotency import lookup as _idem_lookup
 from mobile_endpoints.api._idempotency import run_idempotent
 from mobile_endpoints.api.security import (
@@ -20,7 +25,11 @@ from mobile_endpoints.api.user import resolve_company
 
 # `company` is resolved by resolve_company() (BR-06), not required in the body.
 MANDATORY_PARENT_FIELDS = {"posting_date"}
-MANDATORY_DETAIL_FIELDS = {"payment_type", "party_type", "party", "amount"}
+# `mode_of_payment` is mandatory on the live "Collection and Payment Details"
+# DocType ("Row #1: Value missing for: Mode of Payment"), so it is mandatory in
+# this API's contract too -- for create AND update. Leaving it optional here
+# only moved the failure from a clean 422 to a DocType-level save error.
+MANDATORY_DETAIL_FIELDS = {"payment_type", "party_type", "party", "amount", "mode_of_payment"}
 PARTY_NAME_FIELDS = {
 	"Customer": "customer_name",
 	"Supplier": "supplier_name",
@@ -73,6 +82,60 @@ def _payment_detail(data: dict[str, Any]) -> dict[str, Any]:
 	return detail
 
 
+def _validated_detail(data: dict[str, Any]) -> dict[str, Any]:
+	"""Validate + normalize the `detail` block for create AND update, so both
+	enforce exactly the same contract.
+
+	Every field in MANDATORY_DETAIL_FIELDS must be present -- `mode_of_payment`
+	included, because it is mandatory on the live DocType. `detail` is always a
+	COMPLETE replacement: a missing field is a 422, never a silent carry-over of
+	whatever the stored row happened to hold.
+
+	Raises (-> 422) before the caller ever touches the document, so a rejected
+	request neither saves anything nor leaves an idempotency reservation behind.
+	"""
+	detail = _payment_detail(data)
+
+	# Checked first, and with the field named, so the client can render this
+	# one inline next to its input instead of as a generic toast.
+	mode_of_payment = cstr(detail.get("mode_of_payment")).strip()
+	if not mode_of_payment:
+		raise FieldValidationError(_("A mode of payment is required"), field="mode_of_payment")
+	if not frappe.db.exists("Mode of Payment", mode_of_payment):
+		raise FieldValidationError(_("Invalid mode of payment"), field="mode_of_payment")
+	require_doctype_permission("Mode of Payment", "read", mode_of_payment)
+
+	_ensure_fields(MANDATORY_DETAIL_FIELDS, detail, _("Child Validation Error"))
+
+	amount = flt(detail.get("amount"))
+	if amount <= 0:
+		frappe.throw(_("Amount must be greater than zero"), frappe.ValidationError)
+
+	payment_type = cstr(detail.get("payment_type")).strip().title()
+	if payment_type not in {"Pay", "Receive"}:
+		frappe.throw(_("Unsupported payment type"), frappe.ValidationError)
+
+	party_type = cstr(detail.get("party_type")).strip()
+	if party_type not in PARTY_NAME_FIELDS:
+		frappe.throw(_("Unsupported party type"), frappe.ValidationError)
+
+	party = cstr(detail.get("party")).strip()
+	if not frappe.db.exists(party_type, party):
+		frappe.throw(_("Invalid party"), frappe.ValidationError)
+	require_doctype_permission(party_type, "read", party)
+
+	return {
+		"payment_type": payment_type,
+		"party_type": party_type,
+		"party": party,
+		# Party name is always taken from the server, never the client payload.
+		"party_name": cstr(frappe.db.get_value(party_type, party, PARTY_NAME_FIELDS[party_type]) or party),
+		"amount": amount,
+		"mode_of_payment": mode_of_payment,
+		"description": cstr(detail.get("description")),
+	}
+
+
 # --- API: create ---------------------------------------------------------------
 
 
@@ -82,10 +145,17 @@ def create_collection_payment():
 	"""
 	POST /api/method/mobile_endpoints.api.payment.create_collection_payment
 
-	Body may include a `client_request_id` (UUID); replaying the same id returns
-	the original payment instead of creating a duplicate. `company` is optional —
-	it is resolved from the explicit value, then the user/global default, then the
-	single permitted company (BR-06); otherwise a 422 with `fields.company`.
+	Body: `{posting_date, company?, client_request_id?, detail: {payment_type,
+	party_type, party, amount, mode_of_payment, description?}}`.
+
+	Every `detail` field above except `description` is REQUIRED — including
+	`mode_of_payment`, which is mandatory on the live DocType. A missing one is a
+	422 raised before anything is written.
+
+	`client_request_id` (UUID): replaying the same id returns the original payment
+	instead of creating a duplicate. `company` is optional — it is resolved from
+	the explicit value, then the user/global default, then the single permitted
+	company (BR-06); otherwise a 422 with `fields.company`.
 	"""
 	set_cors_headers("POST, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
@@ -103,44 +173,21 @@ def create_collection_payment():
 	# permitted company; otherwise CompanyError -> 422 with fields.company.
 	company = resolve_company(data.get("company"))
 
-	detail = _payment_detail(data)
-	_ensure_fields(MANDATORY_DETAIL_FIELDS, detail, _("Child Validation Error"))
-	amount = flt(detail.get("amount"))
-	if amount <= 0:
-		frappe.throw(_("Amount must be greater than zero"), frappe.ValidationError)
-
-	payment_type = cstr(detail.get("payment_type")).strip().title()
-	if payment_type not in {"Pay", "Receive"}:
-		frappe.throw(_("Unsupported payment type"), frappe.ValidationError)
-	party_type = cstr(detail.get("party_type")).strip()
-	if party_type not in PARTY_NAME_FIELDS:
-		frappe.throw(_("Unsupported party type"), frappe.ValidationError)
-	party = cstr(detail.get("party")).strip()
-	if not frappe.db.exists(party_type, party):
-		frappe.throw(_("Invalid party"), frappe.ValidationError)
-	require_doctype_permission(party_type, "read", party)
-	# Party name is always taken from the server, never the client payload.
-	party_name = cstr(frappe.db.get_value(party_type, party, PARTY_NAME_FIELDS[party_type]) or party)
-
-	mode_of_payment = cstr(detail.get("mode_of_payment")).strip()
-	if mode_of_payment:
-		if not frappe.db.exists("Mode of Payment", mode_of_payment):
-			frappe.throw(_("Invalid mode of payment"), frappe.ValidationError)
-		require_doctype_permission("Mode of Payment", "read", mode_of_payment)
-
-	description = cstr(detail.get("description"))
+	# Raises 422 for anything missing/invalid BEFORE run_idempotent reserves a
+	# key, so a rejected request leaves no Mobile Request Log row at all.
+	detail = _validated_detail(data)
 
 	# Idempotency hash covers the resolved (server-side) values, not the raw id.
 	idem_payload = {
 		"posting_date": data.get("posting_date"),
 		"company": company,
 		"detail": {
-			"payment_type": payment_type,
-			"party_type": party_type,
-			"party": party,
-			"amount": amount,
-			"mode_of_payment": mode_of_payment,
-			"description": description,
+			"payment_type": detail["payment_type"],
+			"party_type": detail["party_type"],
+			"party": detail["party"],
+			"amount": detail["amount"],
+			"mode_of_payment": detail["mode_of_payment"],
+			"description": detail["description"],
 		},
 	}
 
@@ -155,19 +202,7 @@ def create_collection_payment():
 			parent_values["pamper_collection"] = 1
 		doc.update(parent_values)
 
-		doc.append(
-			"collection_and_payment_details",
-			{
-				"payment_type": payment_type,
-				"party_type": party_type,
-				"party": party,
-				"party_name": party_name,
-				"amount": amount,
-				"mode_of_payment": mode_of_payment or None,
-				"description": description,
-				"is_pamper": 1,
-			},
-		)
+		doc.append("collection_and_payment_details", {**detail, "is_pamper": 1})
 
 		doc.insert(ignore_permissions=False)  # no commit — run_idempotent owns the txn
 		return doc.name, {
@@ -676,11 +711,15 @@ def update_collection_payment(name: str | None = None):
 	"""
 	POST /api/method/mobile_endpoints.api.payment.update_collection_payment
 
-	Body: { name, base_modified?, client_request_id?, posting_date?, company?,
-	        detail?: {payment_type, party_type, party, amount, mode_of_payment?,
-	                   description?} }. `detail`, if present, replaces the whole
-	editable row (mirrors create's shape) -- a partial detail update is not
-	supported since this doctype only ever carries one relevant row.
+	Body: `{name, base_modified?, client_request_id?, posting_date?, company?,
+	detail: {payment_type, party_type, party, amount, mode_of_payment,
+	description?}}`.
+
+	`detail` is REQUIRED and is a COMPLETE replacement of the editable row --
+	this is not a partial update. Every field above except `description` must be
+	sent every time (`mode_of_payment` included: it is mandatory on the live
+	DocType), and an incomplete `detail` is rejected with 422 before the document
+	is loaded or saved. The old stored value is never silently kept.
 	"""
 	set_cors_headers("POST, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
@@ -710,6 +749,13 @@ def update_collection_payment(name: str | None = None):
 				current=_payment_details_dict(doc),
 			)
 
+		# Payload validation comes AFTER the document gate (you don't get told
+		# what's wrong with a payload for a document you may not touch) but
+		# BEFORE any mutation: a 422 here never reaches doc.save(), and
+		# run_idempotent rolls the whole transaction back, so the rejected
+		# request leaves no `processing`/`done` Mobile Request Log row either.
+		detail = _validated_detail(data)
+
 		if data.get("posting_date"):
 			doc.posting_date = data.get("posting_date")
 		if data.get("company"):
@@ -717,42 +763,17 @@ def update_collection_payment(name: str | None = None):
 			# trust a client-supplied company without verifying access to it.
 			doc.company = resolve_company(data.get("company"))
 
-		if "detail" in data or "collection_and_payment_details" in data:
-			detail = _payment_detail(data)
-			_ensure_fields(MANDATORY_DETAIL_FIELDS, detail, _("Child Validation Error"))
-			amount = flt(detail.get("amount"))
-			if amount <= 0:
-				frappe.throw(_("Amount must be greater than zero"), frappe.ValidationError)
-			payment_type = cstr(detail.get("payment_type")).strip().title()
-			if payment_type not in {"Pay", "Receive"}:
-				frappe.throw(_("Unsupported payment type"), frappe.ValidationError)
-			party_type = cstr(detail.get("party_type")).strip()
-			if party_type not in PARTY_NAME_FIELDS:
-				frappe.throw(_("Unsupported party type"), frappe.ValidationError)
-			party = cstr(detail.get("party")).strip()
-			if not frappe.db.exists(party_type, party):
-				frappe.throw(_("Invalid party"), frappe.ValidationError)
-			require_doctype_permission(party_type, "read", party)
-			# Party name is always taken from the server, never the client payload.
-			party_name = cstr(frappe.db.get_value(party_type, party, PARTY_NAME_FIELDS[party_type]) or party)
-
-			mode_of_payment = cstr(detail.get("mode_of_payment")).strip()
-			if mode_of_payment:
-				if not frappe.db.exists("Mode of Payment", mode_of_payment):
-					frappe.throw(_("Invalid mode of payment"), frappe.ValidationError)
-				require_doctype_permission("Mode of Payment", "read", mode_of_payment)
-			description = cstr(detail.get("description"))
-
-			row = _payment_first_detail_row(doc)
-			if row is None:
-				row = doc.append("collection_and_payment_details", {})
-			row.payment_type = payment_type
-			row.party_type = party_type
-			row.party = party
-			row.party_name = party_name
-			row.amount = amount
-			row.mode_of_payment = mode_of_payment or None
-			row.description = description
+		# Full replacement of the one editable row (validated above).
+		row = _payment_first_detail_row(doc)
+		if row is None:
+			row = doc.append("collection_and_payment_details", {})
+		row.payment_type = detail["payment_type"]
+		row.party_type = detail["party_type"]
+		row.party = detail["party"]
+		row.party_name = detail["party_name"]
+		row.amount = detail["amount"]
+		row.mode_of_payment = detail["mode_of_payment"]
+		row.description = detail["description"]
 
 		doc.save(ignore_permissions=False)  # no commit -- run_idempotent owns the txn
 		return doc.name, _payment_details_dict(doc)

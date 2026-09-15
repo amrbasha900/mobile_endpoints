@@ -1235,6 +1235,106 @@ def test_list_row_permissions_follow_the_users_doctype_permission(monkeypatch):
 	assert perms["delete"] is False
 
 
+def _detail_validation_harness(monkeypatch, *, known_modes=("Cash",)):
+	"""Rig for _validated_detail(): a party/mode that exists only when named in
+	`known_modes` (parties always exist), and permission checks that pass."""
+	runtime = fake_frappe()
+
+	class ModeAwareDB(FakeDB):
+		def exists(self, doctype, name):
+			if doctype == "Mode of Payment":
+				return name in known_modes
+			return True
+
+	runtime.db = ModeAwareDB()
+	_patch(monkeypatch, payment, runtime)
+	_patch(monkeypatch, _envelope, runtime)
+	monkeypatch.setattr(payment, "require_doctype_permission", lambda *a, **k: None)
+	return runtime
+
+
+def test_mode_of_payment_is_part_of_the_mandatory_detail_contract():
+	"""It is mandatory on the live DocType; the API contract must match, or a
+	missing value surfaces as a DocType save error instead of a clean 422."""
+	assert "mode_of_payment" in payment.MANDATORY_DETAIL_FIELDS
+
+
+def test_validated_detail_rejects_a_missing_or_blank_mode_of_payment(monkeypatch):
+	_detail_validation_harness(monkeypatch)
+	base = {"payment_type": "Receive", "party_type": "Customer", "party": "CUST-1", "amount": 10}
+
+	# FieldValidationError names the field so the client can show it inline.
+	with pytest.raises(_envelope.FieldValidationError) as omitted:
+		payment._validated_detail({"detail": dict(base)})
+	assert omitted.value.field == "mode_of_payment"
+
+	with pytest.raises(_envelope.FieldValidationError) as blank:
+		payment._validated_detail({"detail": {**base, "mode_of_payment": "   "}})
+	assert blank.value.field == "mode_of_payment"
+
+
+def test_validated_detail_rejects_an_unknown_mode_of_payment(monkeypatch):
+	_detail_validation_harness(monkeypatch, known_modes=("Cash",))
+	with pytest.raises(_envelope.FieldValidationError) as unknown:
+		payment._validated_detail(
+			{
+				"detail": {
+					"payment_type": "Receive",
+					"party_type": "Customer",
+					"party": "CUST-1",
+					"amount": 10,
+					"mode_of_payment": "No Such Mode",
+				}
+			}
+		)
+	assert unknown.value.field == "mode_of_payment"
+
+
+def test_a_field_validation_error_becomes_a_422_naming_that_field(monkeypatch):
+	"""The envelope must carry `fields.mode_of_payment` so the client renders
+	the message inline at the input instead of as a generic toast."""
+	runtime = fake_frappe()
+	_patch(monkeypatch, _envelope, runtime)
+
+	@_envelope.mobile_api
+	def handler():
+		raise _envelope.FieldValidationError("A mode of payment is required", field="mode_of_payment")
+
+	resp = handler()
+	assert resp["success"] is False
+	assert resp["error"]["code"] == "validation_error"
+	assert resp["error"]["fields"] == {"mode_of_payment": "invalid"}
+	assert runtime.local.response["http_status_code"] == 422
+
+
+def test_validated_detail_normalizes_and_never_trusts_a_client_party_name(monkeypatch):
+	runtime = _detail_validation_harness(monkeypatch)
+	runtime.db.values[("Customer", "CUST-1", "customer_name")] = "Real Name"
+
+	out = payment._validated_detail(
+		{
+			"detail": {
+				"payment_type": "receive",
+				"party_type": "Customer",
+				"party": " CUST-1 ",
+				"party_name": "FABRICATED",
+				"amount": "10",
+				"mode_of_payment": " Cash ",
+				"description": "note",
+			}
+		}
+	)
+	assert out == {
+		"payment_type": "Receive",
+		"party_type": "Customer",
+		"party": "CUST-1",
+		"party_name": "Real Name",
+		"amount": 10.0,
+		"mode_of_payment": "Cash",
+		"description": "note",
+	}
+
+
 def test_payment_is_editable_only_while_pending_and_not_cancelled():
 	pending = SimpleNamespace(docstatus=0, status="Pending")
 	blank = SimpleNamespace(docstatus=0, status="")
