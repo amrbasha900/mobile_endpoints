@@ -1235,6 +1235,84 @@ def test_list_row_permissions_follow_the_users_doctype_permission(monkeypatch):
 	assert perms["delete"] is False
 
 
+class _FakeInvoiceDoc:
+	"""Minimal stand-in for an Invoice Form document."""
+
+	def __init__(self, *, docstatus=0, lock_update=0, permissions=("read", "write", "delete", "submit", "print")):
+		self.docstatus = docstatus
+		self.lock_update = lock_update
+		self._permissions = set(permissions)
+
+	def has_permission(self, ptype):
+		return ptype in self._permissions
+
+
+def test_a_new_mobile_invoice_is_reported_as_editable_despite_the_legacy_lock_flag():
+	"""create_invoice_form used to stamp lock_update=1 on every invoice it
+	created, which then came back as `locked` and disabled the list's edit
+	action — while the edit route and update_invoice both allowed the edit."""
+	doc = _FakeInvoiceDoc(docstatus=0, lock_update=1)
+
+	assert invoice._invoice_is_editable(doc) is True
+	perms = invoice._invoice_permissions(doc)
+	assert perms["update"] is True
+	assert perms["locked"] is False
+
+
+@pytest.mark.parametrize(
+	"docstatus,lock_update,permissions",
+	[
+		(0, 0, ("read", "write", "delete", "submit", "print")),  # plain draft
+		(0, 1, ("read", "write", "delete", "submit", "print")),  # legacy pending
+		(1, 0, ("read", "write")),  # submitted
+		(2, 0, ("read", "write")),  # cancelled
+		(0, 0, ("read",)),  # no write permission
+		(0, 1, ("read",)),  # legacy flag AND no write permission
+	],
+)
+def test_update_and_locked_never_contradict_each_other(docstatus, lock_update, permissions):
+	perms = invoice._invoice_permissions(
+		_FakeInvoiceDoc(docstatus=docstatus, lock_update=lock_update, permissions=permissions)
+	)
+	assert perms["locked"] is not perms["update"], (
+		"`locked` must be exactly 'not editable' — never true alongside update"
+	)
+
+
+def test_submitted_and_cancelled_invoices_are_never_editable():
+	for docstatus in (1, 2):
+		doc = _FakeInvoiceDoc(docstatus=docstatus)
+		assert invoice._invoice_is_editable(doc) is False
+		assert invoice._invoice_permissions(doc)["update"] is False
+
+
+def test_an_invoice_without_write_permission_is_not_editable():
+	doc = _FakeInvoiceDoc(docstatus=0, permissions=("read",))
+	assert invoice._invoice_is_editable(doc) is False
+	assert invoice._invoice_permissions(doc)["update"] is False
+
+
+def test_create_invoice_form_no_longer_stamps_the_legacy_lock_flag():
+	"""Existing rows keep whatever they have (no bulk update); new ones simply
+	stop acquiring a flag nothing reads."""
+	assert "lock_update" not in inspect.getsource(invoice.create_invoice_form)
+
+
+def test_invoice_editability_has_exactly_one_implementation():
+	"""get_invoices / get_invoice_details / update_invoice must all go through
+	the same helper, and the old generic one must not come back."""
+	assert not hasattr(security, "document_permissions"), (
+		"the generic document_permissions() derived `locked` from lock_update — "
+		"it must not exist alongside _invoice_is_editable"
+	)
+	for fn in (invoice.get_invoices, invoice.get_invoice_details, invoice.update_invoice):
+		source = inspect.getsource(fn)
+		assert "_invoice_is_editable" in source or "_invoice_permissions" in source, (
+			f"{fn.__name__} must use the shared editability helper"
+		)
+		assert "lock_update" not in source, f"{fn.__name__} must not consult the legacy flag"
+
+
 def _detail_validation_harness(monkeypatch, *, known_modes=("Cash",)):
 	"""Rig for _validated_detail(): a party/mode that exists only when named in
 	`known_modes` (parties always exist), and permission checks that pass."""

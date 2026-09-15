@@ -10,7 +10,6 @@ from mobile_endpoints.api._envelope import StaleDocumentError, mobile_api, ok
 from mobile_endpoints.api._idempotency import lookup as _idem_lookup
 from mobile_endpoints.api._idempotency import run_idempotent
 from mobile_endpoints.api.security import (
-	document_permissions,
 	require_authenticated_user,
 	require_doctype_permission,
 	set_cors_headers,
@@ -104,6 +103,43 @@ def _normalized_item(item: dict) -> dict:
 		"price": price,
 		"total": qty * price,
 		"customer": customer,
+	}
+
+
+# --- editability: ONE source of truth ---------------------------------------
+#
+# `lock_update` is a legacy flag this app itself stamps onto every invoice it
+# creates; it never gated anything server-side (update_invoice has always
+# checked docstatus + write permission, never lock_update). Feeding it into the
+# permissions payload as `locked` produced a response that contradicted itself
+# -- `update: true` together with `locked: true` -- which the mobile list read
+# as "not editable" while the edit route and the update endpoint both happily
+# allowed the edit. It is deliberately NOT consulted here any more, so the
+# invoices already carrying it behave like any other draft. No existing data is
+# touched; create simply stops stamping it (see create_invoice_form).
+
+
+def _invoice_is_editable(doc) -> bool:
+	"""Draft/Pending (docstatus 0) + document-level write permission. Submitted
+	(1) and Cancelled (2) are never editable. This is the single rule behind
+	get_invoices, get_invoice_details and update_invoice alike."""
+	if int(getattr(doc, "docstatus", 0) or 0) != 0:
+		return False
+	return bool(doc.has_permission("write"))
+
+
+def _invoice_permissions(doc) -> dict[str, bool]:
+	"""UI hints derived from _invoice_is_editable, so `update` and `locked` can
+	never disagree: locked is exactly "not editable"."""
+	editable = _invoice_is_editable(doc)
+	docstatus = int(getattr(doc, "docstatus", 0) or 0)
+	return {
+		"read": bool(doc.has_permission("read")),
+		"update": editable,
+		"delete": docstatus == 0 and bool(doc.has_permission("delete")),
+		"submit": docstatus == 0 and bool(doc.has_permission("submit")),
+		"print": bool(doc.has_permission("print") or doc.has_permission("read")),
+		"locked": not editable,
 	}
 
 
@@ -313,7 +349,7 @@ def get_invoices(
 
 		supplier_display = _get_party_display("Supplier", r.supplier, r.supplier_name)
 		doc = frappe.get_doc(DOCTYPE, r.name)
-		permissions = document_permissions(doc)
+		permissions = _invoice_permissions(doc)
 		invoices.append({
 			"id": r.name,
 			"invoiceNumber": r.name,
@@ -398,7 +434,8 @@ def get_invoice_details(name: str | None = None):
 
 	status_map = {0: "draft", 1: "submitted", 2: "cancelled"}
 	status = status_map.get(doc.docstatus or 0, "draft")
-	is_locked = bool(getattr(doc, "lock_update", False))
+	# Same rule as the permissions block below -- never the legacy flag.
+	is_locked = not _invoice_is_editable(doc)
 
 	items = []
 	doc_customer = cstr(getattr(doc, "customer", ""))
@@ -430,7 +467,7 @@ def get_invoice_details(name: str | None = None):
 	supplier_display = _get_party_display("Supplier", getattr(doc, "supplier", ""), getattr(doc, "supplier_name", ""))
 	customer_display = _get_party_display("Customer", getattr(doc, "customer", ""), getattr(doc, "customer_name", ""))
 
-	permissions = document_permissions(doc)
+	permissions = _invoice_permissions(doc)
 	return {
 		"id": cstr(getattr(doc, "name", name)),
 		"invoiceNumber": cstr(getattr(doc, "name", name)),
@@ -551,7 +588,6 @@ def create_invoice_form():
 			"posting_date": posting_date,
 			"posting_time": nowtime(),
 			"is_draft": 1,
-			"lock_update": 1,
 			"supplier": supplier,
 			"supplier_name": supplier_name,
 			"customer": customer,
@@ -634,7 +670,7 @@ def update_invoice(name: str | None = None, data: dict | None = None):
 		doc = frappe.get_doc(DOCTYPE, name)
 		if not doc.has_permission("write"):
 			frappe.throw("Not permitted", frappe.PermissionError)
-		if int(doc.docstatus or 0) != 0:
+		if not _invoice_is_editable(doc):
 			frappe.throw(_("Only draft invoices can be updated"), frappe.ValidationError)
 
 		# Optimistic concurrency — fresh path only; a replay returns the stored result.

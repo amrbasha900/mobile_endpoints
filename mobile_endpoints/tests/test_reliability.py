@@ -630,6 +630,110 @@ class TestDeleteOutcome(ReliabilityTestCase):
 		self.assertEqual(frappe.local.response.get("http_status_code"), 404)
 
 
+class TestInvoiceEditability(ReliabilityTestCase):
+	"""One rule behind get_invoices / get_invoice_details / update_invoice:
+	docstatus 0 + write permission. The legacy `lock_update` flag (which this
+	app used to stamp on every invoice it created) must not make an otherwise
+	editable invoice look locked."""
+
+	def _get_invoices(self, **kw):
+		_set_get_request()
+		return invoice_api.get_invoices(**kw)
+
+	def _get_details(self, name: str):
+		_set_get_request()
+		return invoice_api.get_invoice_details(name=name)
+
+	def _row_for(self, name: str, **kw):
+		today_str = frappe.utils.today()
+		resp = _expect_success(
+			self._get_invoices(from_date=today_str, to_date=today_str, page_size=100, **kw),
+			"get_invoices",
+		)
+		return next((row for row in resp["invoices"] if row["invoiceNumber"] == name), None)
+
+	def test_an_invoice_created_by_this_api_is_reported_as_editable(self):
+		created = self.create_invoice_ok(str(uuid.uuid4()))
+
+		details = _expect_success(self._get_details(created["name"]), "get_invoice_details")
+		self.assertTrue(details["permissions"]["update"], _dump(details["permissions"]))
+		self.assertFalse(details["permissions"]["locked"])
+		self.assertFalse(details["is_locked"])
+
+		row = self._row_for(created["name"])
+		self.assertIsNotNone(row, "the new invoice must appear in the list")
+		self.assertTrue(row["permissions"]["update"])
+		self.assertFalse(row["permissions"]["locked"])
+
+	def test_update_and_locked_never_contradict_each_other(self):
+		created = self.create_invoice_ok(str(uuid.uuid4()))
+		for source, perms in (
+			("details", _expect_success(self._get_details(created["name"]), "details")["permissions"]),
+			("list", self._row_for(created["name"])["permissions"]),
+		):
+			self.assertNotEqual(
+				perms["update"], perms["locked"], f"{source}: update and locked must be opposites"
+			)
+
+	def test_a_legacy_pending_invoice_carrying_lock_update_is_still_editable(self):
+		"""Existing rows keep the flag (no bulk update); they must follow the
+		new rule anyway."""
+		created = self.create_invoice_ok(str(uuid.uuid4()))
+		# Test-only: put the legacy flag back on, exactly as older rows have it.
+		frappe.db.set_value("Invoice Form", created["name"], "lock_update", 1)
+		frappe.db.commit()
+
+		details = _expect_success(self._get_details(created["name"]), "get_invoice_details")
+		self.assertTrue(details["permissions"]["update"])
+		self.assertFalse(details["permissions"]["locked"])
+
+		# ...and the update endpoint agrees: it really can be edited.
+		updated = _expect_success(
+			self.update_invoice(
+				created["name"],
+				[{"item_code": self.item_code, "qty": 3, "price": 10}],
+				details["modified"],
+				client_request_id=str(uuid.uuid4()),
+			),
+			"update_invoice on a legacy-locked invoice",
+		)
+		self.assertEqual(updated["grand_total"], 30)
+
+	def test_a_submitted_invoice_is_not_editable_by_anyone(self):
+		created = self.create_invoice_ok(str(uuid.uuid4()))
+		self.submit_invoice(created["name"], client_request_id=str(uuid.uuid4()))
+
+		details = _expect_success(self._get_details(created["name"]), "get_invoice_details")
+		self.assertFalse(details["permissions"]["update"])
+		self.assertTrue(details["permissions"]["locked"])
+
+		rejected = self.update_invoice(
+			created["name"],
+			[{"item_code": self.item_code, "qty": 4, "price": 10}],
+			details["modified"],
+			client_request_id=str(uuid.uuid4()),
+		)
+		self.assertFalse(rejected["success"], f"expected a 422, got:\n{_dump(rejected)}")
+		self.assertEqual(rejected["error"]["code"], "validation_error")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 422)
+
+	def test_a_user_without_write_permission_gets_403_from_update(self):
+		created = self.create_invoice_ok(str(uuid.uuid4()))
+		frappe.set_user(self.other_user)
+		try:
+			resp = self.update_invoice(
+				created["name"],
+				[{"item_code": self.item_code, "qty": 2, "price": 10}],
+				created["modified"],
+				client_request_id=str(uuid.uuid4()),
+			)
+		finally:
+			frappe.set_user("Administrator")
+		self.assertFalse(resp["success"])
+		self.assertEqual(resp["error"]["code"], "permission_denied")
+		self.assertEqual(frappe.local.response.get("http_status_code"), 403)
+
+
 # --------------------------------------------------------------------------- #
 #  invoice list: date-range period + server summary (Phase 02 increment 4)   #
 # --------------------------------------------------------------------------- #

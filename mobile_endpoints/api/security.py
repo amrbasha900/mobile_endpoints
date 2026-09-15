@@ -82,15 +82,11 @@ def require_doctype_permission(doctype: str, ptype: str, doc=None) -> None:
 		)
 
 
-def document_permissions(doc) -> dict[str, bool]:
-	"""Return UI hints backed by the same server-side permission checks."""
-	docstatus = int(getattr(doc, "docstatus", 0) or 0)
-	locked = bool(getattr(doc, "lock_update", False))
-	return {
-		"read": bool(doc.has_permission("read")),
-		"update": docstatus == 0 and bool(doc.has_permission("write")),
-		"delete": docstatus == 0 and bool(doc.has_permission("delete")),
-		"submit": docstatus == 0 and bool(doc.has_permission("submit")),
-		"print": bool(doc.has_permission("print") or doc.has_permission("read")),
-		"locked": locked,
-	}
+# NOTE: the generic `document_permissions()` that used to live here was
+# removed. It derived `locked` from the legacy `lock_update` field while
+# deriving `update` from docstatus + write permission, so it could report
+# `update: true` and `locked: true` for the very same document -- which is
+# exactly the contradiction the mobile list tripped over. Each doctype now owns
+# one rule: invoice.py's `_invoice_is_editable`/`_invoice_permissions` and
+# payment.py's `_payment_is_editable`/`_payment_permissions`, each deriving
+# `locked` as "not editable" so the two can never disagree.
