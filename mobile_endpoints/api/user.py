@@ -105,6 +105,19 @@ OAUTH_CONFIG_KEYS = {
 	"web": ("pamper_oauth_web_client_id", "pamper_oauth_web_redirect_uri"),
 }
 
+# RUNTIME KILL SWITCH, one per platform, default OFF.
+#
+# The client's build-time flag alone cannot be the rollback: turning OAuth off
+# would need a new build and a store release. This server-side switch turns it
+# off for every client immediately, and the client falls straight back to
+# legacy login. Absent key == disabled, so a site that has never heard of these
+# keys keeps behaving exactly as it does today.
+OAUTH_ENABLED_KEYS = {
+	"android": "pamper_oauth_android_enabled",
+	"ios": "pamper_oauth_ios_enabled",
+	"web": "pamper_oauth_web_enabled",
+}
+
 
 _ABSOLUTE_URI_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:\S+$")
 
@@ -151,6 +164,7 @@ def get_oauth_config(platform: str | None = None):
 		)
 
 	base_url = get_url().rstrip("/")
+	oauth_enabled = bool(frappe.conf.get(OAUTH_ENABLED_KEYS[requested], False))
 	config = {
 		"platform": requested,
 		"issuer": base_url,
@@ -162,10 +176,19 @@ def get_oauth_config(platform: str | None = None):
 		"pkce_required": True,
 		"client_id": None,
 		"redirect_uri": None,
+		"oauth_enabled": oauth_enabled,
 		"oauth_configured": False,
 		"legacy_login_allowed": bool(frappe.conf.get("pamper_allow_legacy_api_key_login", False)),
 		"status": "not_configured",
 	}
+
+	if not oauth_enabled:
+		# The runtime kill switch, checked FIRST: a disabled platform hands out
+		# no client id and no redirect URI at all, so a client cannot start a
+		# flow even if it wanted to. Flipping this key off is the rollback —
+		# it needs no new build and no store release.
+		config["status"] = "disabled"
+		return config
 
 	if requested == "web":
 		# Browser-held OAuth tokens are not an option for this product: Web must

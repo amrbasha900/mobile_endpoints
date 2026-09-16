@@ -303,6 +303,7 @@ def _oauth_harness(monkeypatch, config=None):
 
 
 ANDROID_CONFIG = {
+	"pamper_oauth_android_enabled": True,
 	"pamper_oauth_android_client_id": "android-client-id-placeholder",
 	"pamper_oauth_android_redirect_uri": "https://auth.example/oauth2redirect",
 }
@@ -336,6 +337,7 @@ def test_each_platform_reads_its_own_config_keys(monkeypatch):
 		monkeypatch,
 		{
 			**ANDROID_CONFIG,
+			"pamper_oauth_ios_enabled": True,
 			"pamper_oauth_ios_client_id": "ios-client-id-placeholder",
 			"pamper_oauth_ios_redirect_uri": "https://auth.example/ios-redirect",
 		},
@@ -350,7 +352,9 @@ def test_each_platform_reads_its_own_config_keys(monkeypatch):
 
 
 def test_an_unconfigured_platform_reports_not_configured_without_naming_keys(monkeypatch):
-	_oauth_harness(monkeypatch, ANDROID_CONFIG)  # ios deliberately absent
+	# ios is switched ON but has no client configured — the two states are
+	# distinct and must not be conflated.
+	_oauth_harness(monkeypatch, {**ANDROID_CONFIG, "pamper_oauth_ios_enabled": True})
 
 	resp = user.get_oauth_config(platform="ios")
 	data = resp["data"]
@@ -369,6 +373,7 @@ def test_web_reports_bff_required_and_hands_out_no_client_id(monkeypatch):
 	_oauth_harness(
 		monkeypatch,
 		{
+			"pamper_oauth_web_enabled": True,
 			"pamper_oauth_web_client_id": "web-client-id-placeholder",
 			"pamper_oauth_web_redirect_uri": "https://app.example/callback",
 		},
@@ -412,6 +417,7 @@ def test_an_unacceptable_configured_redirect_uri_is_not_advertised(monkeypatch, 
 	_oauth_harness(
 		monkeypatch,
 		{
+			"pamper_oauth_android_enabled": True,
 			"pamper_oauth_android_client_id": "android-client-id-placeholder",
 			"pamper_oauth_android_redirect_uri": redirect_uri,
 		},
@@ -428,6 +434,7 @@ def test_a_custom_scheme_redirect_uri_is_accepted_as_the_native_fallback(monkeyp
 	_oauth_harness(
 		monkeypatch,
 		{
+			"pamper_oauth_ios_enabled": True,
 			"pamper_oauth_ios_client_id": "ios-client-id-placeholder",
 			"pamper_oauth_ios_redirect_uri": "com.reflection.pamperapp:/oauth2redirect",
 		},
@@ -488,6 +495,96 @@ def test_an_options_preflight_short_circuits(monkeypatch):
 	resp = user.get_oauth_config(platform="android")
 	assert resp["success"] is True
 	assert resp["data"] == {}
+
+
+# --------------------------------------------------------------------------- #
+#  runtime kill switch (Phase 03 increment 3A)                               #
+# --------------------------------------------------------------------------- #
+
+
+def test_oauth_is_disabled_by_default_on_a_site_that_never_configured_it(monkeypatch):
+	"""Absent key == disabled. A site that has never heard of these settings
+	keeps behaving exactly as it does today."""
+	_oauth_harness(monkeypatch, {})
+
+	for platform in ("android", "ios", "web"):
+		data = user.get_oauth_config(platform=platform)["data"]
+		assert data["oauth_enabled"] is False
+		assert data["status"] == "disabled"
+
+
+def test_a_disabled_platform_hands_out_no_client_id_even_when_configured(monkeypatch):
+	"""The kill switch is checked FIRST: a client cannot start a flow even if
+	the OAuth Client is fully configured."""
+	_oauth_harness(
+		monkeypatch,
+		{
+			"pamper_oauth_android_enabled": False,
+			"pamper_oauth_android_client_id": "android-client-id-placeholder",
+			"pamper_oauth_android_redirect_uri": "https://auth.example/oauth2redirect",
+		},
+	)
+
+	data = user.get_oauth_config(platform="android")["data"]
+
+	assert data["status"] == "disabled"
+	assert data["oauth_enabled"] is False
+	assert data["oauth_configured"] is False
+	assert data["client_id"] is None
+	assert data["redirect_uri"] is None
+
+
+def test_flipping_the_switch_off_is_a_rollback_to_legacy(monkeypatch):
+	"""Turning the key off must leave legacy login untouched — that is the
+	whole point of a server-side rollback that needs no new build."""
+	enabled = {**ANDROID_CONFIG, "pamper_allow_legacy_api_key_login": True}
+	_oauth_harness(monkeypatch, enabled)
+	assert user.get_oauth_config(platform="android")["data"]["status"] == "ready"
+
+	_oauth_harness(monkeypatch, {**enabled, "pamper_oauth_android_enabled": False})
+	data = user.get_oauth_config(platform="android")["data"]
+	assert data["status"] == "disabled"
+	assert data["legacy_login_allowed"] is True
+
+
+def test_the_switch_is_per_platform(monkeypatch):
+	_oauth_harness(
+		monkeypatch,
+		{
+			**ANDROID_CONFIG,
+			"pamper_oauth_ios_enabled": False,
+			"pamper_oauth_ios_client_id": "ios-client-id-placeholder",
+			"pamper_oauth_ios_redirect_uri": "https://auth.example/ios-redirect",
+		},
+	)
+
+	assert user.get_oauth_config(platform="android")["data"]["status"] == "ready"
+	assert user.get_oauth_config(platform="ios")["data"]["status"] == "disabled"
+
+
+def test_every_documented_status_is_reachable(monkeypatch):
+	"""disabled | ready | not_configured | misconfigured | bff_required."""
+	_oauth_harness(monkeypatch, {})
+	assert user.get_oauth_config(platform="android")["data"]["status"] == "disabled"
+
+	_oauth_harness(monkeypatch, ANDROID_CONFIG)
+	assert user.get_oauth_config(platform="android")["data"]["status"] == "ready"
+
+	_oauth_harness(monkeypatch, {"pamper_oauth_ios_enabled": True})
+	assert user.get_oauth_config(platform="ios")["data"]["status"] == "not_configured"
+
+	_oauth_harness(
+		monkeypatch,
+		{
+			"pamper_oauth_ios_enabled": True,
+			"pamper_oauth_ios_client_id": "c",
+			"pamper_oauth_ios_redirect_uri": "http://insecure.example/cb",
+		},
+	)
+	assert user.get_oauth_config(platform="ios")["data"]["status"] == "misconfigured"
+
+	_oauth_harness(monkeypatch, {"pamper_oauth_web_enabled": True})
+	assert user.get_oauth_config(platform="web")["data"]["status"] == "bff_required"
 
 
 def test_cors_headers_only_reflect_an_allowlisted_origin(monkeypatch):

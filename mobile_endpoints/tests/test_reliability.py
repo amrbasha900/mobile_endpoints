@@ -1820,6 +1820,29 @@ class TestOAuthDiscoveryContract(ReliabilityTestCase):
 		self.assertFalse(data["redirect_uri"].lower().startswith("http://"))
 		self.assertNotIn("*", data["redirect_uri"])
 
+	def test_the_runtime_kill_switch_is_reported_per_platform(self):
+		"""Server-side rollback: flipping pamper_oauth_<platform>_enabled off
+		disables OAuth for every client with no new build. Absent == disabled."""
+		for platform in ("android", "ios", "web"):
+			data = _expect_success(self._get_config(platform), f"get_oauth_config({platform})")
+			self.assertIn("oauth_enabled", data)
+			self.assertEqual(
+				data["oauth_enabled"],
+				bool(frappe.conf.get(f"pamper_oauth_{platform}_enabled", False)),
+			)
+			if not data["oauth_enabled"]:
+				# A disabled platform must hand out nothing a client could start with.
+				self.assertEqual(data["status"], "disabled")
+				self.assertIsNone(data["client_id"])
+				self.assertIsNone(data["redirect_uri"])
+				self.assertFalse(data["oauth_configured"])
+
+	def test_status_is_one_of_the_documented_values(self):
+		allowed = {"disabled", "ready", "not_configured", "misconfigured", "bff_required"}
+		for platform in ("android", "ios", "web"):
+			data = _expect_success(self._get_config(platform), f"get_oauth_config({platform})")
+			self.assertIn(data["status"], allowed)
+
 	def test_legacy_login_flag_is_reported_and_still_enabled(self):
 		"""Phase 03 must not disable legacy login."""
 		data = _expect_success(self._get_config("android"), "get_oauth_config(android)")

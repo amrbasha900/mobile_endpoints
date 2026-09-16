@@ -298,7 +298,9 @@ def test_missing_oauth_configuration_reports_not_configured(monkeypatch):
 	must be able to read (alongside `legacy_login_allowed`) — not a 503 that
 	tells it nothing. The 503 error surface itself is still exported for the
 	documented vocabulary."""
-	runtime = fake_frappe(config={})
+	# Switched ON but with no client configured: "enabled but not set up" and
+	# "switched off" are distinct states and must not be conflated.
+	runtime = fake_frappe(config={"pamper_oauth_android_enabled": True})
 	runtime.local.request = SimpleNamespace(method="GET", headers={})
 	monkeypatch.setattr(user, "frappe", runtime)
 	monkeypatch.setattr(user, "set_cors_headers", lambda methods: None)
@@ -306,6 +308,7 @@ def test_missing_oauth_configuration_reports_not_configured(monkeypatch):
 	resp = user.get_oauth_config(platform="android")
 
 	assert resp["success"] is True
+	assert resp["data"]["oauth_enabled"] is True
 	assert resp["data"]["oauth_configured"] is False
 	assert resp["data"]["status"] == "not_configured"
 	assert resp["data"]["client_id"] is None
