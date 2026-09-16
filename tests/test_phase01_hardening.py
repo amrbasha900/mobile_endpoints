@@ -292,13 +292,21 @@ def test_disabled_legacy_login_is_secure_by_default(monkeypatch):
 	assert exc_info.value.http_status_code == 410
 
 
-def test_missing_oauth_configuration_returns_service_unavailable(monkeypatch):
+def test_missing_oauth_configuration_reports_not_configured(monkeypatch):
+	"""Phase 03 changed this contract deliberately: discovery is a pre-login
+	endpoint, so "this platform isn't set up yet" is a normal answer the client
+	must be able to read (alongside `legacy_login_allowed`) — not a 503 that
+	tells it nothing. The 503 error surface itself is still exported for the
+	documented vocabulary."""
 	runtime = fake_frappe(config={})
 	runtime.local.request = SimpleNamespace(method="GET", headers={})
 	monkeypatch.setattr(user, "frappe", runtime)
 	monkeypatch.setattr(user, "set_cors_headers", lambda methods: None)
 
-	with pytest.raises(user.OAuthConfigurationError) as exc_info:
-		user.get_oauth_config()
+	resp = user.get_oauth_config(platform="android")
 
-	assert exc_info.value.http_status_code == 503
+	assert resp["success"] is True
+	assert resp["data"]["oauth_configured"] is False
+	assert resp["data"]["status"] == "not_configured"
+	assert resp["data"]["client_id"] is None
+	assert user.OAuthConfigurationError.http_status_code == 503

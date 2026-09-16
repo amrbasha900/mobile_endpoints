@@ -85,6 +85,7 @@ from mobile_endpoints.api import invoice as invoice_api
 from mobile_endpoints.api import operation as operation_api
 from mobile_endpoints.api import payment as payment_api
 from mobile_endpoints.api import security as security_api
+from mobile_endpoints.api import user as user_api
 from mobile_endpoints.api._idempotency import DOCTYPE as LOG_DOCTYPE
 from mobile_endpoints.api._idempotency import _composite
 
@@ -1742,6 +1743,91 @@ class TestOperationStatus(ReliabilityTestCase):
 		self.assertTrue(data["found"])
 		self.assertEqual(data["status"], "done")
 		self.assertEqual(data["name"], created)
+
+
+class TestOAuthDiscoveryContract(ReliabilityTestCase):
+	"""get_oauth_config against a real site. Native PKCE itself is VERIFIED
+	LIVE by scripts/oauth_pkce_probe.py; these guard the discovery contract
+	the clients read before login."""
+
+	def _get_config(self, platform):
+		_set_get_request()
+		return user_api.get_oauth_config(platform=platform)
+
+	def test_discovery_answers_for_every_allowed_platform(self):
+		for platform in ("android", "ios", "web"):
+			data = _expect_success(self._get_config(platform), f"get_oauth_config({platform})")
+			self.assertEqual(data["platform"], platform)
+			self.assertTrue(data["issuer"].startswith("http"))
+			self.assertTrue(data["token_endpoint"].endswith("oauth2.get_token"))
+			self.assertTrue(data["authorization_endpoint"].endswith("oauth2.authorize"))
+			self.assertTrue(data["revoke_endpoint"].endswith("oauth2.revoke_token"))
+			self.assertEqual(data["code_challenge_method"], "S256")
+			self.assertTrue(data["pkce_required"])
+			self.assertEqual(data["scopes_supported"], "openid all")
+
+	def test_an_unsupported_platform_is_422_naming_the_field(self):
+		for platform in ("desktop", "", "windows"):
+			resp = self._get_config(platform)
+			self.assertFalse(resp["success"], f"expected 422 for {platform!r}:\n{_dump(resp)}")
+			self.assertEqual(resp["error"]["code"], "validation_error")
+			self.assertIn("platform", resp["error"]["fields"])
+			self.assertEqual(frappe.local.response.get("http_status_code"), 422)
+
+	def test_web_never_hands_the_browser_a_client_id(self):
+		data = _expect_success(self._get_config("web"), "get_oauth_config(web)")
+		self.assertEqual(data["status"], "bff_required")
+		self.assertIsNone(data["client_id"])
+		self.assertIsNone(data["redirect_uri"])
+		self.assertFalse(data["oauth_configured"])
+
+	def test_no_secret_ever_appears_in_the_discovery_response(self):
+		for platform in ("android", "ios", "web"):
+			rendered = json.dumps(self._get_config(platform), default=str).lower()
+			self.assertNotIn("secret", rendered)
+			self.assertNotIn("api_key", rendered)
+
+	def test_discovery_is_readable_before_login(self):
+		"""It is consumed by a Guest on the login screen."""
+		frappe.set_user("Guest")
+		try:
+			resp = self._get_config("android")
+		finally:
+			frappe.set_user("Administrator")
+		self.assertTrue(resp["success"], _dump(resp))
+
+	def test_a_request_cannot_substitute_its_own_redirect_uri(self):
+		"""The endpoint takes only `platform`; the redirect URI comes from site
+		config. Frappe matches redirect URIs exactly (frappe/oauth.py:29-42), so
+		a request-controlled value would be an open-redirect hole."""
+		_set_get_request()
+		frappe.local.form_dict = frappe._dict(
+			{"platform": "android", "redirect_uri": "https://evil.example/steal"}
+		)
+		resp = user_api.get_oauth_config(platform="android")
+		data = _expect_success(resp, "get_oauth_config(android)")
+		if data["redirect_uri"]:
+			self.assertNotIn("evil.example", data["redirect_uri"])
+
+	def test_configured_platform_reports_ready_with_a_non_cleartext_redirect(self):
+		"""Skips unless this site actually has the android client configured —
+		it asserts the shape of a READY answer without requiring the fixture."""
+		data = _expect_success(self._get_config("android"), "get_oauth_config(android)")
+		if data["status"] != "ready":
+			self.skipTest(f"android OAuth not configured on this site (status={data['status']})")
+		self.assertTrue(data["oauth_configured"])
+		self.assertTrue(data["client_id"])
+		self.assertFalse(data["redirect_uri"].lower().startswith("http://"))
+		self.assertNotIn("*", data["redirect_uri"])
+
+	def test_legacy_login_flag_is_reported_and_still_enabled(self):
+		"""Phase 03 must not disable legacy login."""
+		data = _expect_success(self._get_config("android"), "get_oauth_config(android)")
+		self.assertIn("legacy_login_allowed", data)
+		self.assertEqual(
+			data["legacy_login_allowed"],
+			bool(frappe.conf.get("pamper_allow_legacy_api_key_login", False)),
+		)
 
 
 class TestEnvelope(ReliabilityTestCase):

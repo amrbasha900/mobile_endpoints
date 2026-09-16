@@ -292,17 +292,202 @@ def test_get_user_profile_options_preflight_short_circuits(monkeypatch):
 	assert resp["data"] == {}
 
 
-def test_get_oauth_config_available_when_configured(monkeypatch):
-	runtime = fake_frappe(config={"pamper_oauth_client_id": "pamper-web"})
+def _oauth_harness(monkeypatch, config=None):
+	runtime = fake_frappe(config=config or {})
 	runtime.local.request = SimpleNamespace(method="GET", headers={})
 	_patch(monkeypatch, user, runtime)
 	_patch(monkeypatch, security, runtime)
+	_patch(monkeypatch, _envelope, runtime)
 	monkeypatch.setattr(user, "set_cors_headers", lambda methods: None)
+	return runtime
 
-	config = user.get_oauth_config()
-	assert config["client_id"] == "pamper-web"
-	assert config["pkce_required"] is True
-	assert config["token_endpoint"].endswith("oauth2.get_token")
+
+ANDROID_CONFIG = {
+	"pamper_oauth_android_client_id": "android-client-id-placeholder",
+	"pamper_oauth_android_redirect_uri": "https://auth.example/oauth2redirect",
+}
+
+
+def test_get_oauth_config_is_ready_when_the_platform_is_configured(monkeypatch):
+	_oauth_harness(monkeypatch, ANDROID_CONFIG)
+
+	resp = user.get_oauth_config(platform="android")
+	data = resp["data"]
+
+	assert resp["success"] is True
+	assert data["platform"] == "android"
+	assert data["status"] == "ready"
+	assert data["oauth_configured"] is True
+	assert data["client_id"] == "android-client-id-placeholder"
+	assert data["redirect_uri"] == "https://auth.example/oauth2redirect"
+	assert data["code_challenge_method"] == "S256"
+	assert data["pkce_required"] is True
+	assert data["scopes_supported"] == "openid all"
+	assert data["token_endpoint"].endswith("oauth2.get_token")
+	assert data["authorization_endpoint"].endswith("oauth2.authorize")
+	assert data["revoke_endpoint"].endswith("oauth2.revoke_token")
+	assert data["issuer"]
+
+
+def test_each_platform_reads_its_own_config_keys(monkeypatch):
+	"""One OAuth Client per Site x Environment x Platform — android must never
+	hand out ios's client id."""
+	_oauth_harness(
+		monkeypatch,
+		{
+			**ANDROID_CONFIG,
+			"pamper_oauth_ios_client_id": "ios-client-id-placeholder",
+			"pamper_oauth_ios_redirect_uri": "https://auth.example/ios-redirect",
+		},
+	)
+
+	android = user.get_oauth_config(platform="android")["data"]
+	ios = user.get_oauth_config(platform="ios")["data"]
+
+	assert android["client_id"] == "android-client-id-placeholder"
+	assert ios["client_id"] == "ios-client-id-placeholder"
+	assert android["redirect_uri"] != ios["redirect_uri"]
+
+
+def test_an_unconfigured_platform_reports_not_configured_without_naming_keys(monkeypatch):
+	_oauth_harness(monkeypatch, ANDROID_CONFIG)  # ios deliberately absent
+
+	resp = user.get_oauth_config(platform="ios")
+	data = resp["data"]
+
+	assert resp["success"] is True
+	assert data["oauth_configured"] is False
+	assert data["status"] == "not_configured"
+	assert data["client_id"] is None and data["redirect_uri"] is None
+	# A guest-reachable endpoint must not map out which site-config key is missing.
+	assert "pamper_oauth_ios_client_id" not in json.dumps(resp)
+
+
+def test_web_reports_bff_required_and_hands_out_no_client_id(monkeypatch):
+	"""Browser-held OAuth tokens are not an option: web must go through a BFF,
+	and must not be given a client id it could start browser-PKCE with."""
+	_oauth_harness(
+		monkeypatch,
+		{
+			"pamper_oauth_web_client_id": "web-client-id-placeholder",
+			"pamper_oauth_web_redirect_uri": "https://app.example/callback",
+		},
+	)
+
+	data = user.get_oauth_config(platform="web")["data"]
+
+	assert data["status"] == "bff_required"
+	assert data["oauth_configured"] is False
+	assert data["client_id"] is None
+	assert data["redirect_uri"] is None
+
+
+@pytest.mark.parametrize("platform", ["", None, "desktop", "windows", "../android"])
+def test_platform_outside_the_allowlist_is_422(monkeypatch, platform):
+	_oauth_harness(monkeypatch, ANDROID_CONFIG)
+
+	resp = user.get_oauth_config(platform=platform)
+
+	assert resp["success"] is False
+	assert resp["error"]["code"] == "validation_error"
+	assert "platform" in resp["error"]["fields"]
+
+
+def test_platform_is_matched_case_insensitively_after_trimming(monkeypatch):
+	_oauth_harness(monkeypatch, ANDROID_CONFIG)
+	assert user.get_oauth_config(platform=" Android ")["data"]["status"] == "ready"
+
+
+@pytest.mark.parametrize(
+	"redirect_uri",
+	[
+		"http://auth.example/oauth2redirect",   # cleartext
+		"https://auth.example/*",               # wildcard
+		"*",
+		"not-a-uri",
+		"   ",
+	],
+)
+def test_an_unacceptable_configured_redirect_uri_is_not_advertised(monkeypatch, redirect_uri):
+	_oauth_harness(
+		monkeypatch,
+		{
+			"pamper_oauth_android_client_id": "android-client-id-placeholder",
+			"pamper_oauth_android_redirect_uri": redirect_uri,
+		},
+	)
+
+	data = user.get_oauth_config(platform="android")["data"]
+
+	assert data["oauth_configured"] is False
+	assert data["redirect_uri"] is None
+	assert data["status"] in {"misconfigured", "not_configured"}
+
+
+def test_a_custom_scheme_redirect_uri_is_accepted_as_the_native_fallback(monkeypatch):
+	_oauth_harness(
+		monkeypatch,
+		{
+			"pamper_oauth_ios_client_id": "ios-client-id-placeholder",
+			"pamper_oauth_ios_redirect_uri": "com.reflection.pamperapp:/oauth2redirect",
+		},
+	)
+	data = user.get_oauth_config(platform="ios")["data"]
+	assert data["status"] == "ready"
+	assert data["redirect_uri"] == "com.reflection.pamperapp:/oauth2redirect"
+
+
+def test_a_client_supplied_redirect_uri_can_never_be_echoed_back(monkeypatch):
+	"""The endpoint takes no redirect_uri argument at all — the configured one
+	is the only one it can return. A request-controlled value would be an
+	open-redirect hole, and Frappe matches redirect URIs exactly anyway."""
+	assert list(inspect.signature(user.get_oauth_config).parameters) == ["platform"]
+
+	runtime = _oauth_harness(monkeypatch, ANDROID_CONFIG)
+	runtime.local.form_dict = {"redirect_uri": "https://evil.example/steal"}
+
+	data = user.get_oauth_config(platform="android")["data"]
+	assert data["redirect_uri"] == "https://auth.example/oauth2redirect"
+
+
+def test_the_config_response_never_contains_a_secret(monkeypatch):
+	_oauth_harness(
+		monkeypatch,
+		{
+			**ANDROID_CONFIG,
+			# Even if someone puts a secret in site config, it must not surface.
+			"pamper_oauth_android_client_secret": "SECRET-SENTINEL",
+			"pamper_oauth_client_secret": "SECRET-SENTINEL-2",
+		},
+	)
+
+	rendered = json.dumps(user.get_oauth_config(platform="android"))
+
+	assert "SECRET-SENTINEL" not in rendered
+	assert "secret" not in rendered.lower()
+
+
+def test_legacy_login_availability_is_reported_to_the_client(monkeypatch):
+	_oauth_harness(monkeypatch, {**ANDROID_CONFIG, "pamper_allow_legacy_api_key_login": True})
+	assert user.get_oauth_config(platform="android")["data"]["legacy_login_allowed"] is True
+
+	_oauth_harness(monkeypatch, ANDROID_CONFIG)
+	assert user.get_oauth_config(platform="android")["data"]["legacy_login_allowed"] is False
+
+
+def test_discovery_needs_no_authentication(monkeypatch):
+	"""It is read BEFORE login, so it must not require a session."""
+	runtime = _oauth_harness(monkeypatch, ANDROID_CONFIG)
+	runtime.session = SimpleNamespace(user="Guest")
+	assert user.get_oauth_config(platform="android")["success"] is True
+
+
+def test_an_options_preflight_short_circuits(monkeypatch):
+	runtime = _oauth_harness(monkeypatch, ANDROID_CONFIG)
+	runtime.local.request = SimpleNamespace(method="OPTIONS", headers={})
+	resp = user.get_oauth_config(platform="android")
+	assert resp["success"] is True
+	assert resp["data"] == {}
 
 
 def test_cors_headers_only_reflect_an_allowlisted_origin(monkeypatch):
@@ -683,6 +868,7 @@ PUBLIC_ENDPOINTS_EXPECTED_ENVELOPE: dict[object, list[str]] = {
 		"get_user_default_company",
 		"get_user_profile",
 		"list_companies",
+		"get_oauth_config",
 	],
 	utils: [
 		"get_supplier",
@@ -695,7 +881,7 @@ PUBLIC_ENDPOINTS_EXPECTED_ENVELOPE: dict[object, list[str]] = {
 }
 
 PUBLIC_ENDPOINTS_DELIBERATELY_UNWRAPPED: dict[object, list[str]] = {
-	user: ["login_with_profile", "get_oauth_config"],
+	user: ["login_with_profile"],
 }
 
 
