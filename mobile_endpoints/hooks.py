@@ -242,3 +242,11 @@ app_license = "mit"
 # 	"Logging DocType Name": 30  # days to retain logs
 # }
 
+
+
+# --- Mobile Endpoints: idempotency ledger cleanup ---------------------------
+scheduler_events = {
+	"daily": [
+		"mobile_endpoints.api._idempotency.cleanup_old_logs",
+	],
+}

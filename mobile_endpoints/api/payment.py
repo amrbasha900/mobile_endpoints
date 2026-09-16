@@ -1,377 +1,969 @@
+from types import SimpleNamespace
+from typing import Any
+
 import frappe
 from frappe import _
-from frappe.utils import cint, cstr
-from frappe.utils.password import get_decrypted_password
-from typing import Dict, Any
+from frappe.utils import cint, cstr, flt
+
+from mobile_endpoints.api._dates import resolve_period, site_timezone
+from mobile_endpoints.api._envelope import (
+	FieldValidationError,
+	StaleDocumentError,
+	mobile_api,
+	ok,
+)
+from mobile_endpoints.api._idempotency import lookup as _idem_lookup
+from mobile_endpoints.api._idempotency import run_idempotent
+from mobile_endpoints.api.security import (
+	require_authenticated_user,
+	require_doctype_permission,
+	set_cors_headers,
+)
+from mobile_endpoints.api.user import resolve_company
 
 # --- helpers ---------------------------------------------------------------
 
-MANDATORY_PARENT_FIELDS = {"posting_date", "company"}
-MANDATORY_DETAIL_FIELDS = {"payment_type", "party_type", "party", "party_name", "amount"}
+# `company` is resolved by resolve_company() (BR-06), not required in the body.
+MANDATORY_PARENT_FIELDS = {"posting_date"}
+# `mode_of_payment` is mandatory on the live "Collection and Payment Details"
+# DocType ("Row #1: Value missing for: Mode of Payment"), so it is mandatory in
+# this API's contract too -- for create AND update. Leaving it optional here
+# only moved the failure from a clean 422 to a DocType-level save error.
+MANDATORY_DETAIL_FIELDS = {"payment_type", "party_type", "party", "amount", "mode_of_payment"}
+PARTY_NAME_FIELDS = {
+	"Customer": "customer_name",
+	"Supplier": "supplier_name",
+	"Employee": "employee_name",
+	"Shareholder": "title",
+}
 
-def _set_cors_headers(methods: str) -> None:
-    headers = frappe.local.response.setdefault("headers", {})
-    origin = ""
-    if frappe.local.request:
-        origin = frappe.local.request.headers.get("Origin") or ""
-    headers["Access-Control-Allow-Origin"] = origin or "*"
-    headers["Vary"] = "Origin"
-    headers["Access-Control-Allow-Credentials"] = "true"
-    headers["Access-Control-Allow-Methods"] = methods
-    headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-
-def _authenticate_token() -> bool:
-    if not frappe.local.request:
-        return False
-    auth = frappe.local.request.headers.get("Authorization") or ""
-    if not auth.lower().startswith("token "):
-        return False
-    token = auth[6:].strip()
-    if ":" not in token:
-        return False
-    api_key, api_secret = token.split(":", 1)
-    user = frappe.db.get_value("User", {"api_key": api_key}, "name")
-    if not user:
-        return False
-    try:
-        stored_secret = get_decrypted_password("User", user, "api_secret")
-    except Exception:
-        return False
-    if stored_secret != api_secret:
-        return False
-    frappe.set_user(user)
-    return True
 
 def _display_name(code: str | None, name: str | None) -> str:
-    code = cstr(code or "").strip()
-    name = cstr(name or "").strip()
-    if not code and not name:
-        return ""
-    if not name or name == code:
-        return code or name
-    return f"{name} ({code})"
+	code = cstr(code or "").strip()
+	name = cstr(name or "").strip()
+	if not code and not name:
+		return ""
+	if not name or name == code:
+		return code or name
+	return f"{name} ({code})"
 
-def _get_default_company() -> str:
-    company = cstr(frappe.defaults.get_user_default("company") or "")
-    if company:
-        return company
-    company = cstr(frappe.defaults.get_global_default("company") or "")
-    if company:
-        return company
-    company = cstr(frappe.db.get_single_value("Global Defaults", "default_company") or "")
-    if company:
-        return company
-    return cstr(frappe.db.get_value("Company", {}, "name") or "")
 
-def _ensure_fields(required: set[str], data: Dict[str, Any], title: str) -> None:
-    missing = [field for field in required if not data.get(field)]
-    if missing:
-        frappe.throw(
-            _("Missing required fields: {0}").format(", ".join(missing)),
-            title=title,
-        )
+def _ensure_fields(required: set[str], data: dict[str, Any], title: str) -> None:
+	missing = sorted(field for field in required if not data.get(field))
+	if missing:
+		frappe.throw(
+			_("Missing required fields: {0}").format(", ".join(missing)),
+			title=title,
+		)
 
-def _extract_payload() -> Dict[str, Any]:
-    if frappe.request and frappe.request.method == "POST":
-        try:
-            return frappe.parse_json(frappe.request.get_data(as_text=True) or '{}')
-        except Exception:
-            frappe.throw(_("Unable to parse JSON body"), title=_("Invalid Request"))
-    return frappe.form_dict or {}
 
-# --- API: create -----------------------------------------------------------
+def _extract_payload() -> dict[str, Any]:
+	if frappe.request and frappe.request.method == "POST":
+		try:
+			payload = frappe.parse_json(frappe.request.get_data(as_text=True) or "{}")
+		except (TypeError, ValueError):
+			frappe.throw(_("Unable to parse JSON body"), title=_("Invalid Request"))
+	else:
+		payload = frappe.form_dict or {}
+	if not isinstance(payload, dict):
+		frappe.throw(_("JSON body must be an object"), frappe.ValidationError)
+	return payload
 
-@frappe.whitelist(methods=["POST"])
+
+def _payment_detail(data: dict[str, Any]) -> dict[str, Any]:
+	detail = data.get("detail")
+	if detail is None:
+		details = data.get("collection_and_payment_details") or []
+		if not isinstance(details, list):
+			frappe.throw(_("Payment details must be a list"), frappe.ValidationError)
+		detail = details[0] if details else None
+	if not isinstance(detail, dict):
+		frappe.throw(_("At least one payment detail is required"), frappe.ValidationError)
+	return detail
+
+
+def _validated_detail(data: dict[str, Any]) -> dict[str, Any]:
+	"""Validate + normalize the `detail` block for create AND update, so both
+	enforce exactly the same contract.
+
+	Every field in MANDATORY_DETAIL_FIELDS must be present -- `mode_of_payment`
+	included, because it is mandatory on the live DocType. `detail` is always a
+	COMPLETE replacement: a missing field is a 422, never a silent carry-over of
+	whatever the stored row happened to hold.
+
+	Raises (-> 422) before the caller ever touches the document, so a rejected
+	request neither saves anything nor leaves an idempotency reservation behind.
+	"""
+	detail = _payment_detail(data)
+
+	# Checked first, and with the field named, so the client can render this
+	# one inline next to its input instead of as a generic toast.
+	mode_of_payment = cstr(detail.get("mode_of_payment")).strip()
+	if not mode_of_payment:
+		raise FieldValidationError(_("A mode of payment is required"), field="mode_of_payment")
+	if not frappe.db.exists("Mode of Payment", mode_of_payment):
+		raise FieldValidationError(_("Invalid mode of payment"), field="mode_of_payment")
+	require_doctype_permission("Mode of Payment", "read", mode_of_payment)
+
+	_ensure_fields(MANDATORY_DETAIL_FIELDS, detail, _("Child Validation Error"))
+
+	amount = flt(detail.get("amount"))
+	if amount <= 0:
+		frappe.throw(_("Amount must be greater than zero"), frappe.ValidationError)
+
+	payment_type = cstr(detail.get("payment_type")).strip().title()
+	if payment_type not in {"Pay", "Receive"}:
+		frappe.throw(_("Unsupported payment type"), frappe.ValidationError)
+
+	party_type = cstr(detail.get("party_type")).strip()
+	if party_type not in PARTY_NAME_FIELDS:
+		frappe.throw(_("Unsupported party type"), frappe.ValidationError)
+
+	party = cstr(detail.get("party")).strip()
+	if not frappe.db.exists(party_type, party):
+		frappe.throw(_("Invalid party"), frappe.ValidationError)
+	require_doctype_permission(party_type, "read", party)
+
+	return {
+		"payment_type": payment_type,
+		"party_type": party_type,
+		"party": party,
+		# Party name is always taken from the server, never the client payload.
+		"party_name": cstr(frappe.db.get_value(party_type, party, PARTY_NAME_FIELDS[party_type]) or party),
+		"amount": amount,
+		"mode_of_payment": mode_of_payment,
+		"description": cstr(detail.get("description")),
+	}
+
+
+# --- API: create ---------------------------------------------------------------
+
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+@mobile_api
 def create_collection_payment():
-    """
-    POST /api/method/mobile_endpoints.api.payment.create_collection_payment
+	"""
+	POST /api/method/mobile_endpoints.api.payment.create_collection_payment
 
-    Expected payload:
-    {
-      "posting_date": "2025-12-26",
-      "company": "My Company",
-      "pamper_collection_and_payment": 0,  # ignored, always forced to 1
-      "detail": {
-        "payment_type": "Pay",
-        "party_type": "Customer",
-        "party": "1020013",
-        "party_name": "ابو صالح",
-        "amount": 41,
-        "mode_of_payment": "بنك الراجحي -93427 - ( 3 )"
-      }
-    }
-    """
-    _set_cors_headers("POST, OPTIONS")
-    if frappe.local.request and frappe.local.request.method == "OPTIONS":
-        return {}
+	Body: `{posting_date, company?, client_request_id?, detail: {payment_type,
+	party_type, party, amount, mode_of_payment, description?}}`.
 
-    token_ok = _authenticate_token()
-    user = frappe.session.user
-    if (not user or user == "Guest") and not token_ok:
-        frappe.throw(_("Not permitted"), title=_("Unauthorized"), http_status_code=401)
+	Every `detail` field above except `description` is REQUIRED — including
+	`mode_of_payment`, which is mandatory on the live DocType. A missing one is a
+	422 raised before anything is written.
 
-    data = _extract_payload()
-    if not data.get("company"):
-        data["company"] = _get_default_company()
-    _ensure_fields(MANDATORY_PARENT_FIELDS, data, _("Parent Validation Error"))
+	`client_request_id` (UUID): replaying the same id returns the original payment
+	instead of creating a duplicate. `company` is optional — it is resolved from
+	the explicit value, then the user/global default, then the single permitted
+	company (BR-06); otherwise a 422 with `fields.company`.
+	"""
+	set_cors_headers("POST, OPTIONS")
+	if frappe.local.request and frappe.local.request.method == "OPTIONS":
+		return {}
 
-    detail = data.get("detail") or (data.get("collection_and_payment_details") or [{}])[0]
-    if not detail:
-        frappe.throw(_("At least one payment detail is required"), title=_("Child Validation Error"))
-    _ensure_fields(MANDATORY_DETAIL_FIELDS, detail, _("Child Validation Error"))
+	require_authenticated_user()
+	require_doctype_permission("Collection and Payment", "create")
 
-    try:
-        doc = frappe.new_doc("Collection and Payment")
-        doc.update({
-            "posting_date": data["posting_date"],
-            "company": data["company"],
-            "pamper_collection_and_payment": 1,   # force the checkbox
-            "pamper_collection": 1 if doc.meta.has_field("pamper_collection") else None,
-        })
+	data = _extract_payload()
+	client_request_id = data.get("client_request_id")
 
-        doc.append("collection_and_payment_details", {
-            "payment_type": detail["payment_type"],
-            "party_type": detail["party_type"],
-            "party": detail["party"],
-            "party_name": detail["party_name"],
-            "amount": detail["amount"],
-            "mode_of_payment": detail.get("mode_of_payment"),
-            "description": detail.get("description"), 
-            "is_pamper": 1,
-        })
+	_ensure_fields(MANDATORY_PARENT_FIELDS, data, _("Parent Validation Error"))
 
-        doc.insert(ignore_permissions=False)
-        frappe.db.commit()
+	# Explicit company (permission-checked) -> user/global default -> the single
+	# permitted company; otherwise CompanyError -> 422 with fields.company.
+	company = resolve_company(data.get("company"))
 
-        return {
-            "success": True,
-            "message": _("Collection payment created"),
-            "name": doc.name,
-            "posting_date": doc.posting_date,
-        }
-    except frappe.ValidationError as exc:
-        frappe.log_error(frappe.get_traceback(), "Collection Payment ValidationError")
-        frappe.throw(str(exc), title=_("Validation Error"))
-    except Exception as exc:
-        frappe.log_error(frappe.get_traceback(), "Collection Payment Error")
-        frappe.throw(_("Failed to create collection payment: {0}").format(exc), title=_("Server Error"))
+	# Raises 422 for anything missing/invalid BEFORE run_idempotent reserves a
+	# key, so a rejected request leaves no Mobile Request Log row at all.
+	detail = _validated_detail(data)
+
+	# Idempotency hash covers the resolved (server-side) values, not the raw id.
+	idem_payload = {
+		"posting_date": data.get("posting_date"),
+		"company": company,
+		"detail": {
+			"payment_type": detail["payment_type"],
+			"party_type": detail["party_type"],
+			"party": detail["party"],
+			"amount": detail["amount"],
+			"mode_of_payment": detail["mode_of_payment"],
+			"description": detail["description"],
+		},
+	}
+
+	def _create():
+		doc = frappe.new_doc("Collection and Payment")
+		parent_values = {
+			"posting_date": data["posting_date"],
+			"company": company,
+			"pamper_collection_and_payment": 1,
+		}
+		if doc.meta.has_field("pamper_collection"):
+			parent_values["pamper_collection"] = 1
+		doc.update(parent_values)
+
+		doc.append("collection_and_payment_details", {**detail, "is_pamper": 1})
+
+		doc.insert(ignore_permissions=False)  # no commit — run_idempotent owns the txn
+		return doc.name, {
+			"name": doc.name,
+			"posting_date": cstr(doc.posting_date),
+			"company": company,
+			"modified": cstr(doc.modified),
+			"message": _("Collection payment created"),
+		}
+
+	return run_idempotent(client_request_id, "payment.create", idem_payload, _create)
+
+
+@frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
+def get_payment_by_request_id(client_request_id: str | None = None):
+	"""Called by the client after a create POST times out."""
+	set_cors_headers("GET, OPTIONS")
+	if frappe.local.request and frappe.local.request.method == "OPTIONS":
+		return {}
+	require_authenticated_user()
+	return _idem_lookup(client_request_id, "payment.create")
+
 
 # --- API: list -------------------------------------------------------------
 
-@frappe.whitelist()
-def list_collection_payments(page: int = 1, page_size: int = 20):
-    """
-    GET /api/method/mobile_endpoints.api.payment.list_collection_payments?page=1&page_size=20
-    Returns only documents where pamper_collection_and_payment = 1.
-    """
-    page = max(1, cint(page))
-    page_size = min(100, max(1, cint(page_size)))
-    start = (page - 1) * page_size
 
-    parents = frappe.get_all(
-        "Collection and Payment",
-        filters={"pamper_collection_and_payment": 1},
-        fields=["name", "posting_date", "company", "owner", "creation", "status"],
-        order_by="creation desc",
-        limit_start=start,
-        limit_page_length=page_size,
-    )
-
-    if not parents:
-        return {"payments": [], "has_more": False}
-
-    parent_names = [p["name"] for p in parents]
-    child_rows = frappe.get_all(
-        "Collection and Payment Details",
-        filters={"parent": ("in", parent_names)},
-        fields=["parent", "payment_type", "party_type", "party", "party_name", "amount", "mode_of_payment", "description"],
-        order_by="idx asc",
-    )
-
-    first_row_map: Dict[str, Dict[str, Any]] = {}
-    for row in child_rows:
-        first_row_map.setdefault(row["parent"], row)
-
-    results = []
-    for parent in parents:
-        row = first_row_map.get(parent["name"])
-        if not row:
-            continue
-        results.append({
-            "name": parent["name"],
-            "posting_date": parent["posting_date"],
-            "company": parent["company"],
-            "status": parent.get("status"),
-            "payment_type": row["payment_type"],
-            "party_type": row["party_type"],
-            "party": row["party"],
-            "party_name": row["party_name"],
-            "amount": row["amount"],
-            "mode_of_payment": row["mode_of_payment"],
-            "description": row["description"],
-        })
-
-    has_more = len(parents) == page_size
-    return {"payments": results, "has_more": has_more}
+def _normalize_payment_status(value) -> str:
+	"""Mirrors the deployed client's own TransactionsPage normalizeStatus():
+	Approved/Paid -> approved, Rejected -> rejected, everything else
+	(including blank/unset) -> pending. Not inventing a new vocabulary --
+	just moving the existing client-side classification onto the server so
+	the summary agrees with what a user already sees on screen."""
+	normalized = cstr(value).strip().lower()
+	if normalized in {"approved", "paid"}:
+		return "approved"
+	if normalized == "rejected":
+		return "rejected"
+	return "pending"
 
 
-@frappe.whitelist()
+def _status_row_filter(status: str) -> list:
+	"""Row-level SQL condition for one status bucket. `not in` is used (not a
+	`!=`/exclusion built from _normalize_payment_status's blank->pending rule)
+	because Frappe's query builder is documented to treat `!=`/`not in`
+	filters as NULL-inclusive (`(status NOT IN (...) OR status IS NULL)`) --
+	unlike a bare SQL `!=`/`NOT IN`, which would silently drop blank-status
+	rows from "pending". This specific NULL-inclusive behavior is the one
+	piece of this change that could not be verified without a live bench --
+	see TestPaymentFilters.test_pending_status_filter_includes_blank_status
+	in test_reliability.py, which must pass on the real bench before this is
+	trusted for the "pending" bucket."""
+	if status == "approved":
+		return ["status", "in", ["Approved", "Paid"]]
+	if status == "rejected":
+		return ["status", "=", "Rejected"]
+	return ["status", "not in", ["Approved", "Paid", "Rejected"]]
+
+
+@frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
+def list_collection_payments(
+	page: int = 1,
+	page_size: int = 20,
+	start_date: str | None = None,
+	end_date: str | None = None,
+	from_date: str | None = None,
+	to_date: str | None = None,
+	company: str | None = None,
+	search: str | None = None,
+	party_type: str | None = None,
+	party: str | None = None,
+	payment_type: str | None = None,
+	status: str | None = None,
+):
+	"""
+	GET /api/method/mobile_endpoints.api.payment.list_collection_payments
+	Returns only documents where pamper_collection_and_payment = 1.
+	`from_date`/`to_date` are canonical (`start_date`/`end_date` kept as
+	aliases); neither given -> defaults to "today" in the site timezone.
+
+	`party_type`/`party`/`payment_type`/`search` filter on the CHILD
+	"Collection and Payment Details" table via frappe.get_list's child-table
+	filter form (`[child_doctype, fieldname, operator, value]`) applied to
+	the PARENT doctype query -- the join and the permission-query condition
+	execute as ONE query, so a child-row match can never surface a parent the
+	caller isn't authorized to see. This is the one part of this change that
+	could not be verified without a live bench (see the module docstring's
+	"Request-harness policy" and TestPaymentFilters below); no unrestricted
+	child-table scan is used anywhere in this function.
+	"""
+	set_cors_headers("GET, OPTIONS")
+	if frappe.local.request and frappe.local.request.method == "OPTIONS":
+		return {}
+
+	require_authenticated_user()
+	require_doctype_permission("Collection and Payment", "read")
+
+	page = max(1, cint(page))
+	page_size = min(100, max(1, cint(page_size)))
+	start = (page - 1) * page_size
+
+	resolved_from, resolved_to = resolve_period(from_date or start_date, to_date or end_date)
+
+	# Shared by rows AND the summary below: date/company/search/party/
+	# payment_type -- only STATUS is excluded from base_filters (applied
+	# separately, below, to `filters` for rows only), so a status card never
+	# hides the others and a status-filtered list still reports accurate
+	# counts for every OTHER status.
+	base_filters = [
+		["pamper_collection_and_payment", "=", 1],
+		["posting_date", ">=", resolved_from],
+		["posting_date", "<=", resolved_to],
+	]
+	if company:
+		base_filters.append(["company", "=", cstr(company)])
+
+	if party_type is not None:
+		party_type = cstr(party_type).strip()
+		if party_type not in PARTY_NAME_FIELDS:
+			frappe.throw(_("Unsupported party type"), frappe.ValidationError)
+		base_filters.append(["Collection and Payment Details", "party_type", "=", party_type])
+
+	if party:
+		base_filters.append(["Collection and Payment Details", "party", "=", cstr(party)])
+
+	if payment_type is not None:
+		normalized_payment_type = cstr(payment_type).strip().title()
+		if normalized_payment_type not in {"Pay", "Receive"}:
+			frappe.throw(_("Unsupported payment type"), frappe.ValidationError)
+		base_filters.append(["Collection and Payment Details", "payment_type", "=", normalized_payment_type])
+
+	or_filters = None
+	s = cstr(search).strip() if search else ""
+	if s:
+		# Free-text party search -- name and identifier, matching the
+		# deployed client's own search semantics for "who this payment is
+		# with". Amount/date substring matching is intentionally NOT
+		# replicated here: date now has a dedicated, more precise range
+		# filter (from_date/to_date) and amount-substring matching against a
+		# decimal column has no safe equivalent in frappe.get_list's filter
+		# DSL -- see the increment's commit message for this scope decision.
+		or_filters = [
+			["Collection and Payment Details", "party_name", "like", f"%{s}%"],
+			["Collection and Payment Details", "party", "like", f"%{s}%"],
+		]
+
+	filters = list(base_filters)
+	if status:
+		normalized_status = _normalize_payment_status(status)
+		filters.append(_status_row_filter(normalized_status))
+
+	meta = frappe.get_meta("Collection and Payment")
+	has_currency_field = meta.has_field("currency")
+
+	# Doctype-level write/delete permission, evaluated ONCE for this user. Per
+	# row it is combined with that row's own editable state below. The rows
+	# themselves already come from a permission-aware frappe.get_list(), so
+	# document-level read is established; update/delete remain authoritatively
+	# re-checked per document by update_/delete_collection_payment (which call
+	# doc.has_permission()), so these are UI hints, never the gate.
+	can_write_doctype = bool(frappe.has_permission("Collection and Payment", "write"))
+	can_delete_doctype = bool(frappe.has_permission("Collection and Payment", "delete"))
+
+	parents = frappe.get_list(
+		"Collection and Payment",
+		filters=filters,
+		or_filters=or_filters,
+		fields=["name", "posting_date", "company", "owner", "creation", "status", "docstatus"],
+		order_by="creation desc",
+		limit_start=start,
+		limit_page_length=page_size + 1,
+	)
+
+	has_more = len(parents) > page_size
+	parents = parents[:page_size]
+	parent_names = [p["name"] for p in parents]
+
+	child_rows = []
+	if parent_names:
+		child_rows = frappe.get_all(
+			"Collection and Payment Details",
+			filters={"parent": ("in", parent_names)},
+			fields=[
+				"parent",
+				"payment_type",
+				"party_type",
+				"party",
+				"party_name",
+				"amount",
+				"mode_of_payment",
+				"description",
+			],
+			order_by="idx asc",
+		)
+
+	# Assumes (as the pre-existing code already did) one relevant detail row
+	# per parent -- create_collection_payment() always inserts exactly one.
+	first_row_map: dict[str, dict[str, Any]] = {}
+	for row in child_rows:
+		first_row_map.setdefault(row["parent"], row)
+
+	results = []
+	for parent in parents:
+		row = first_row_map.get(parent["name"])
+		if not row:
+			continue
+		row_editable = _payment_is_editable(
+			SimpleNamespace(docstatus=parent.get("docstatus", 0), status=parent.get("status"))
+		)
+		results.append(
+			{
+				"name": parent["name"],
+				"posting_date": parent["posting_date"],
+				"company": parent["company"],
+				"status": parent.get("status"),
+				"permissions": {
+					"read": True,  # it came out of a permission-aware get_list
+					"update": row_editable and can_write_doctype,
+					"delete": row_editable and can_delete_doctype,
+					"locked": not row_editable,
+				},
+				"payment_type": row["payment_type"],
+				"party_type": row["party_type"],
+				"party": row["party"],
+				"party_name": row["party_name"],
+				"amount": row["amount"],
+				"mode_of_payment": row["mode_of_payment"],
+				"description": row["description"],
+			}
+		)
+
+	# --- summary -------------------------------------------------------
+	# Every authorized record matching the SAME date/company/search/party/
+	# payment_type filters as the rows above (base_filters + or_filters,
+	# deliberately NOT `filters`, which also carries the active status
+	# filter) -- the whole filtered set, not just this page, and never
+	# narrowed to just the status card currently selected. Cancelled
+	# (docstatus=2) parents are excluded entirely (never counted, never
+	# included in financial totals). Permission-aware throughout:
+	# frappe.get_list for the parent scope, never get_all/ignore_permissions;
+	# the one frappe.get_all below is scoped to that already-vetted parent
+	# set (child table rows carry no permissions of their own in Frappe).
+	summary_fields = ["name", "status", "docstatus"]
+	if has_currency_field:
+		summary_fields.append("currency")
+	summary_parents = frappe.get_list(
+		"Collection and Payment",
+		filters=base_filters + [["docstatus", "!=", 2]],
+		or_filters=or_filters,
+		fields=summary_fields,
+		limit_page_length=0,
+	)
+
+	total_count = len(summary_parents)
+	approved_count = 0
+	rejected_count = 0
+	approved_names: list[str] = []
+	currency_by_name: dict[str, str] = {}
+	for p in summary_parents:
+		bucket = _normalize_payment_status(p.get("status"))
+		if bucket == "approved":
+			approved_count += 1
+			approved_names.append(p["name"])
+			if has_currency_field:
+				currency_by_name[p["name"]] = cstr(p.get("currency")) or "default"
+		elif bucket == "rejected":
+			rejected_count += 1
+	pending_count = total_count - approved_count - rejected_count
+
+	# Financial totals: approved transactions only, decimal-safe (flt at
+	# currency precision), grouped by currency if this doctype tracks one --
+	# never silently summed across mismatched currencies.
+	totals_by_currency: dict[str, dict[str, float]] = {}
+	if approved_names:
+		summary_child_rows = frappe.get_all(
+			"Collection and Payment Details",
+			filters={"parent": ("in", approved_names)},
+			fields=["parent", "payment_type", "amount"],
+		)
+		for row in summary_child_rows:
+			currency_key = currency_by_name.get(row["parent"], "default") if has_currency_field else "default"
+			bucket = totals_by_currency.setdefault(currency_key, {"inflow": 0.0, "outflow": 0.0})
+			amount = flt(row.get("amount", 0), 2)
+			payment_type = cstr(row.get("payment_type", "")).strip().lower()
+			if payment_type == "pay":
+				bucket["outflow"] = flt(bucket["outflow"] + amount, 2)
+			elif payment_type == "receive":
+				bucket["inflow"] = flt(bucket["inflow"] + amount, 2)
+
+	by_currency = {
+		currency: {
+			"inflow": vals["inflow"],
+			"outflow": vals["outflow"],
+			"net": flt(vals["inflow"] - vals["outflow"], 2),
+		}
+		for currency, vals in totals_by_currency.items()
+	}
+	if len(by_currency) <= 1:
+		only = next(iter(by_currency.values()), {"inflow": 0.0, "outflow": 0.0, "net": 0.0})
+		totals = {**only, "basis": "approved"}
+	else:
+		# Multiple currencies among the authorized, approved results -- a
+		# single combined figure would be misleading. The client must show
+		# `totals_by_currency` separately or require a currency filter.
+		totals = {"basis": "approved", "mixed_currencies": True}
+
+	summary = {
+		"total": total_count,
+		"approved": approved_count,
+		"pending": pending_count,
+		"rejected": rejected_count,
+		"totals": totals,
+	}
+	if has_currency_field:
+		summary["totals_by_currency"] = by_currency
+
+	# --- movement_totals / approved_totals ----------------------------------
+	# Unlike `totals` above (kept exactly as-is for backward compatibility --
+	# base_filters-scoped, approved-only, deliberately ignores the active
+	# status filter so every status card stays meaningful), these DO respect
+	# the active status filter -- they're scoped by `filters`, the same exact
+	# permission-aware row set the user is currently looking at. Cancelled
+	# (docstatus=2) parents are excluded the same way as everywhere else in
+	# this function; "deleted"/"invalid" rows need no extra handling since a
+	# deleted parent can never appear in a fresh frappe.get_list() call and an
+	# unrecognised payment_type is silently skipped (same as `totals` above).
+	totals_scope_fields = ["name", "status", "docstatus"]
+	if has_currency_field:
+		totals_scope_fields.append("currency")
+	totals_scope_parents = frappe.get_list(
+		"Collection and Payment",
+		filters=filters + [["docstatus", "!=", 2]],
+		or_filters=or_filters,
+		fields=totals_scope_fields,
+		limit_page_length=0,
+	)
+	totals_scope_currency_by_name = (
+		{p["name"]: cstr(p.get("currency")) or "default" for p in totals_scope_parents}
+		if has_currency_field
+		else {}
+	)
+	totals_scope_names = [p["name"] for p in totals_scope_parents]
+	totals_scope_child_rows: dict[str, list[dict[str, Any]]] = {}
+	if totals_scope_names:
+		for row in frappe.get_all(
+			"Collection and Payment Details",
+			filters={"parent": ("in", totals_scope_names)},
+			fields=["parent", "payment_type", "amount"],
+		):
+			totals_scope_child_rows.setdefault(row["parent"], []).append(row)
+
+	def _sum_totals(include_buckets: set[str], basis: str) -> dict[str, Any]:
+		by_curr: dict[str, dict[str, float]] = {}
+		for p in totals_scope_parents:
+			if _normalize_payment_status(p.get("status")) not in include_buckets:
+				continue
+			currency_key = totals_scope_currency_by_name.get(p["name"], "default") if has_currency_field else "default"
+			acc = by_curr.setdefault(currency_key, {"inflow": 0.0, "outflow": 0.0})
+			for row in totals_scope_child_rows.get(p["name"], []):
+				amount = flt(row.get("amount", 0), 2)
+				row_payment_type = cstr(row.get("payment_type", "")).strip().lower()
+				if row_payment_type == "pay":
+					acc["outflow"] = flt(acc["outflow"] + amount, 2)
+				elif row_payment_type == "receive":
+					acc["inflow"] = flt(acc["inflow"] + amount, 2)
+		computed = {
+			c: {"inflow": v["inflow"], "outflow": v["outflow"], "net": flt(v["inflow"] - v["outflow"], 2)}
+			for c, v in by_curr.items()
+		}
+		if len(computed) <= 1:
+			only = next(iter(computed.values()), {"inflow": 0.0, "outflow": 0.0, "net": 0.0})
+			return {**only, "basis": basis}
+		return {"basis": basis, "mixed_currencies": True, "by_currency": computed}
+
+	# Pending + Approved (never Rejected/Cancelled) -- "how much has actually
+	# moved, whether or not it's been approved yet". Not an accounting
+	# balance or confirmed cash position.
+	summary["movement_totals"] = _sum_totals({"pending", "approved"}, "active_recorded_movements")
+	summary["approved_totals"] = _sum_totals({"approved"}, "approved")
+
+	data = {
+		"payments": results,
+		"has_more": has_more,
+		"summary": summary,
+		"period": {"from_date": resolved_from, "to_date": resolved_to, "timezone": site_timezone()},
+	}
+	return ok(data, meta={"total_count": total_count})
+
+
+# --- API: details / update / delete (Phase 02 increment 7) -----------------
+#
+# "Collection and Payment" has no JSON fixture in any installed app (same
+# audit finding as increment 5 -- it was created live via the Desk UI, not a
+# doctype file this repo can read). The only state-governing fields this
+# codebase has EVER read or written for it are `status` (blank/"Pending"/
+# "Approved"/"Paid"/"Rejected" -- see _normalize_payment_status, already
+# mirrored from the deployed client) and `docstatus` (0/1/2, already used by
+# every existing filter as `!= 2` = "not cancelled"). There is no
+# `lock_update` field on this doctype anywhere in this codebase (that's an
+# Invoice Form-specific field) and no submit_collection_payment endpoint
+# exists -- nothing here ever transitions docstatus itself. Given that,
+# "editable" is defined as: docstatus == 0 AND status is the "pending"
+# bucket -- the ONLY state this API's own create endpoint ever produces, and
+# the only one the existing client already treats as still-actionable.
+# Approved/Paid/Rejected are treated as externally governed and therefore
+# read-only here. This inference (not a guess at field NAMES, but at the
+# exact business rule) could not be verified against the live site's actual
+# workflow/permission configuration without bench access -- flagged here and
+# in the commit message; the bench-only cross-user/lock tests below must
+# pass on the real site before this is trusted.
+
+
+def _payment_is_editable(doc) -> bool:
+	if int(getattr(doc, "docstatus", 0) or 0) != 0:
+		return False
+	return _normalize_payment_status(getattr(doc, "status", "")) == "pending"
+
+
+def _payment_permissions(doc) -> dict[str, bool]:
+	editable = _payment_is_editable(doc)
+	return {
+		"read": bool(doc.has_permission("read")),
+		"update": editable and bool(doc.has_permission("write")),
+		"delete": editable and bool(doc.has_permission("delete")),
+		"locked": not editable,
+	}
+
+
+def _payment_first_detail_row(doc):
+	rows = getattr(doc, "collection_and_payment_details", None) or []
+	return rows[0] if rows else None
+
+
+def _payment_details_dict(doc) -> dict[str, Any]:
+	"""Canonical parent + (first) detail row snapshot -- used for both the
+	get_collection_payment_details response and a 409's `current` body."""
+	row = _payment_first_detail_row(doc)
+	permissions = _payment_permissions(doc)
+	return {
+		"name": cstr(getattr(doc, "name", "")),
+		"posting_date": cstr(getattr(doc, "posting_date", "")),
+		"company": cstr(getattr(doc, "company", "")),
+		"status": cstr(getattr(doc, "status", "")),
+		"docstatus": int(getattr(doc, "docstatus", 0) or 0),
+		"modified": cstr(getattr(doc, "modified", "")),
+		"payment_type": cstr(getattr(row, "payment_type", "")) if row else "",
+		"party_type": cstr(getattr(row, "party_type", "")) if row else "",
+		"party": cstr(getattr(row, "party", "")) if row else "",
+		"party_name": cstr(getattr(row, "party_name", "")) if row else "",
+		"amount": flt(getattr(row, "amount", 0) or 0) if row else 0,
+		"mode_of_payment": cstr(getattr(row, "mode_of_payment", "")) if row else "",
+		"description": cstr(getattr(row, "description", "")) if row else "",
+		"permissions": permissions,
+		"permission": {
+			"can_update": permissions["update"],
+			"can_delete": permissions["delete"],
+			"locked": permissions["locked"],
+		},
+	}
+
+
+def _payment_request_meta() -> dict:
+	"""Pull the top-level reliability fields out of the raw JSON body once --
+	mirrors invoice.py's _request_meta()."""
+	body = {}
+	if frappe.request and (getattr(frappe.request, "method", "") or "").upper() == "POST":
+		try:
+			body = frappe.parse_json(frappe.request.get_data(as_text=True) or "{}")
+		except Exception:
+			body = {}
+	if not isinstance(body, dict):
+		body = {}
+	fd = frappe.form_dict or {}
+	return {
+		"client_request_id": body.get("client_request_id") or fd.get("client_request_id"),
+		"base_modified": body.get("base_modified") or fd.get("base_modified"),
+		"name": body.get("name") or fd.get("name"),
+	}
+
+
+@frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
+def get_collection_payment_details(name: str | None = None):
+	"""
+	GET /api/method/mobile_endpoints.api.payment.get_collection_payment_details
+	"""
+	set_cors_headers("GET, OPTIONS")
+	if frappe.local.request and frappe.local.request.method == "OPTIONS":
+		return {}
+
+	require_authenticated_user()
+	if not name:
+		frappe.throw(_("Missing payment name"), frappe.ValidationError)
+
+	doc = frappe.get_doc("Collection and Payment", name)
+	if not doc.has_permission("read"):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+
+	return _payment_details_dict(doc)
+
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+@mobile_api
+def update_collection_payment(name: str | None = None):
+	"""
+	POST /api/method/mobile_endpoints.api.payment.update_collection_payment
+
+	Body: `{name, base_modified?, client_request_id?, posting_date?, company?,
+	detail: {payment_type, party_type, party, amount, mode_of_payment,
+	description?}}`.
+
+	`detail` is REQUIRED and is a COMPLETE replacement of the editable row --
+	this is not a partial update. Every field above except `description` must be
+	sent every time (`mode_of_payment` included: it is mandatory on the live
+	DocType), and an incomplete `detail` is rejected with 422 before the document
+	is loaded or saved. The old stored value is never silently kept.
+	"""
+	set_cors_headers("POST, OPTIONS")
+	if frappe.local.request and frappe.local.request.method == "OPTIONS":
+		return {}
+
+	require_authenticated_user()
+
+	meta = _payment_request_meta()
+	name = name or meta["name"]
+	if not name:
+		frappe.throw(_("Missing payment name"), frappe.ValidationError)
+	data = _extract_payload()
+	base_modified = meta["base_modified"]
+	client_request_id = meta["client_request_id"] or data.get("client_request_id")
+
+	def _do():
+		doc = frappe.get_doc("Collection and Payment", name)
+		if not doc.has_permission("write"):
+			frappe.throw(_("Not permitted"), frappe.PermissionError)
+		if not _payment_is_editable(doc):
+			frappe.throw(_("Only pending payments can be updated"), frappe.ValidationError)
+
+		# Optimistic concurrency -- fresh path only; a replay returns the stored result.
+		if base_modified and cstr(doc.modified) != cstr(base_modified):
+			raise StaleDocumentError(
+				_("This payment was changed on the server. Reload the latest data and try again."),
+				current=_payment_details_dict(doc),
+			)
+
+		# Payload validation comes AFTER the document gate (you don't get told
+		# what's wrong with a payload for a document you may not touch) but
+		# BEFORE any mutation: a 422 here never reaches doc.save(), and
+		# run_idempotent rolls the whole transaction back, so the rejected
+		# request leaves no `processing`/`done` Mobile Request Log row either.
+		detail = _validated_detail(data)
+
+		if data.get("posting_date"):
+			doc.posting_date = data.get("posting_date")
+		if data.get("company"):
+			# Re-resolved (and permission-checked) exactly like create -- never
+			# trust a client-supplied company without verifying access to it.
+			doc.company = resolve_company(data.get("company"))
+
+		# Full replacement of the one editable row (validated above).
+		row = _payment_first_detail_row(doc)
+		if row is None:
+			row = doc.append("collection_and_payment_details", {})
+		row.payment_type = detail["payment_type"]
+		row.party_type = detail["party_type"]
+		row.party = detail["party"]
+		row.party_name = detail["party_name"]
+		row.amount = detail["amount"]
+		row.mode_of_payment = detail["mode_of_payment"]
+		row.description = detail["description"]
+
+		doc.save(ignore_permissions=False)  # no commit -- run_idempotent owns the txn
+		return doc.name, _payment_details_dict(doc)
+
+	return run_idempotent(client_request_id, "payment.update", {"name": name, "data": data}, _do)
+
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+@mobile_api
+def delete_collection_payment(name: str | None = None):
+	"""
+	POST /api/method/mobile_endpoints.api.payment.delete_collection_payment
+	"""
+	set_cors_headers("POST, OPTIONS")
+	if frappe.local.request and frappe.local.request.method == "OPTIONS":
+		return {}
+
+	require_authenticated_user()
+
+	meta = _payment_request_meta()
+	name = name or meta["name"]
+	if not name:
+		frappe.throw(_("Missing payment name"), frappe.ValidationError)
+
+	def _do():
+		doc = frappe.get_doc("Collection and Payment", name)
+		if not doc.has_permission("delete"):
+			frappe.throw(_("Not permitted"), frappe.PermissionError)
+		if not _payment_is_editable(doc):
+			frappe.throw(_("Only pending payments can be deleted"), frappe.ValidationError)
+		frappe.delete_doc("Collection and Payment", name, ignore_permissions=False)  # no commit
+		return name, {"deleted": True, "name": cstr(name)}
+
+	# Replaying the same deleting request id returns {deleted:true}; a *fresh*
+	# id against an already-gone doc still raises DoesNotExistError -> 404.
+	return run_idempotent(meta["client_request_id"], "payment.delete", {"name": name}, _do)
+
+
+@frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
 def list_mode_of_payments():
-    """Return enabled Mode of Payment values for mobile UI."""
-    _set_cors_headers("GET, OPTIONS")
-    if frappe.local.request and frappe.local.request.method == "OPTIONS":
-        return {}
+	"""Return enabled Mode of Payment values for mobile UI."""
+	set_cors_headers("GET, OPTIONS")
+	if frappe.local.request and frappe.local.request.method == "OPTIONS":
+		return {}
 
-    token_ok = _authenticate_token()
-    user = frappe.session.user
-    if (not user or user == "Guest") and not token_ok:
-        return {"modes": []}
+	require_authenticated_user()
+	require_doctype_permission("Mode of Payment", "read")
 
-    modes = frappe.get_all(
-        "Mode of Payment",
-        filters={"enabled": 1},
-        fields=["name", "type"],
-        order_by="modified desc"
-    )
-    return {"modes": modes}
+	modes = frappe.get_list(
+		"Mode of Payment", filters={"enabled": 1}, fields=["name", "type"], order_by="modified desc"
+	)
+	return {"modes": modes}
 
 
-@frappe.whitelist(methods=["GET"])
+@frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
 def get_party_references(limit: int | str = 200):
-    _set_cors_headers("GET, OPTIONS")
-    if frappe.local.request and frappe.local.request.method == "OPTIONS":
-        return {}
+	set_cors_headers("GET, OPTIONS")
+	if frappe.local.request and frappe.local.request.method == "OPTIONS":
+		return {}
 
-    token_ok = _authenticate_token()
-    user = frappe.session.user
-    if (not user or user == "Guest") and not token_ok:
-        return {"employees": [], "shareholders": []}
+	require_authenticated_user()
 
-    limit = max(1, min(1000, cint(limit)))
+	limit = max(1, min(1000, cint(limit)))
 
-    employees = frappe.get_all(
-        "Employee",
-        fields=["name", "employee_name"],
-        order_by="modified desc",
-        limit=limit,
-    )
-    shareholders = frappe.get_all(
-        "Shareholder",
-        fields=["name", "title"],
-        order_by="modified desc",
-        limit=limit,
-    )
+	employees = frappe.get_list(
+		"Employee",
+		fields=["name", "employee_name"],
+		order_by="modified desc",
+		limit_page_length=limit,
+	)
+	shareholders = frappe.get_list(
+		"Shareholder",
+		fields=["name", "title"],
+		order_by="modified desc",
+		limit_page_length=limit,
+	)
 
-    return {
-        "employees": [
-            {
-                "code": row["name"],
-                "name": row.get("employee_name") or row["name"],
-                "display": _display_name(row["name"], row.get("employee_name")),
-            }
-            for row in employees
-        ],
-        "shareholders": [
-            {
-                "code": row["name"],
-                "name": row.get("title") or row["name"],
-                "display": _display_name(row["name"], row.get("title")),
-            }
-            for row in shareholders
-        ],
-    }
+	return {
+		"employees": [
+			{
+				"code": row["name"],
+				"name": row.get("employee_name") or row["name"],
+				"display": _display_name(row["name"], row.get("employee_name")),
+			}
+			for row in employees
+		],
+		"shareholders": [
+			{
+				"code": row["name"],
+				"name": row.get("title") or row["name"],
+				"display": _display_name(row["name"], row.get("title")),
+			}
+			for row in shareholders
+		],
+	}
 
 
-@frappe.whitelist(methods=["GET"])
+@frappe.whitelist(allow_guest=True, methods=["GET"])
+@mobile_api
 def get_today_cashflow():
-    """
-    GET /api/method/mobile_endpoints.api.payment.get_today_cashflow
-    Returns hourly inflow/outflow for today from Collection and Payment
-    where pamper_collection_and_payment = 1.
-    """
-    _set_cors_headers("GET, OPTIONS")
-    if frappe.local.request and frappe.local.request.method == "OPTIONS":
-        return {}
+	"""
+	GET /api/method/mobile_endpoints.api.payment.get_today_cashflow
+	Returns hourly inflow/outflow for today from Collection and Payment
+	where pamper_collection_and_payment = 1.
+	"""
+	set_cors_headers("GET, OPTIONS")
+	if frappe.local.request and frappe.local.request.method == "OPTIONS":
+		return {}
 
-    token_ok = _authenticate_token()
-    user = frappe.session.user
-    if (not user or user == "Guest") and not token_ok:
-        frappe.throw(_("Not permitted"), title=_("Unauthorized"), http_status_code=401)
+	require_authenticated_user()
+	require_doctype_permission("Collection and Payment", "read")
 
-    from frappe.utils import today, flt
-    import datetime
+	import datetime
 
-    today_str = today()
+	from frappe.utils import today
 
-    parents = frappe.get_all(
-        "Collection and Payment",
-        filters={
-            "pamper_collection_and_payment": 1,
-            "posting_date": today_str,
-        },
-        fields=["name", "creation"],
-    )
+	today_str = today()
 
-    if not parents:
-        return {"labels": [], "inflow": [], "outflow": [], "total_inflow": 0, "total_outflow": 0, "net": 0}
+	parents = frappe.get_list(
+		"Collection and Payment",
+		filters={
+			"pamper_collection_and_payment": 1,
+			"posting_date": today_str,
+			"docstatus": ("!=", 2),
+		},
+		fields=["name", "creation", "status"],
+		limit_page_length=0,
+	)
 
-    parent_names = [p["name"] for p in parents]
-    creation_map = {p["name"]: p["creation"] for p in parents}
+	if not parents:
+		return {"labels": [], "inflow": [], "outflow": [], "total_inflow": 0, "total_outflow": 0, "net": 0}
 
-    child_rows = frappe.get_all(
-        "Collection and Payment Details",
-        filters={"parent": ("in", parent_names)},
-        fields=["parent", "payment_type", "amount"],
-        order_by="idx asc",
-    )
+	parent_names = [p["name"] for p in parents]
+	creation_map = {p["name"]: p["creation"] for p in parents}
 
-    first_row_map: Dict[str, Dict[str, Any]] = {}
-    for row in child_rows:
-        first_row_map.setdefault(row["parent"], row)
+	child_rows = frappe.get_all(
+		"Collection and Payment Details",
+		filters={"parent": ("in", parent_names)},
+		fields=["parent", "payment_type", "amount"],
+		order_by="idx asc",
+	)
 
-    hourly_inflow: Dict[int, float] = {}
-    hourly_outflow: Dict[int, float] = {}
-    total_inflow = 0.0
-    total_outflow = 0.0
+	rows_by_parent: dict[str, list[dict[str, Any]]] = {}
+	for row in child_rows:
+		rows_by_parent.setdefault(row["parent"], []).append(row)
 
-    for parent in parents:
-        row = first_row_map.get(parent["name"])
-        if not row:
-            continue
-        creation = creation_map.get(parent["name"])
-        if isinstance(creation, str):
-            try:
-                creation = datetime.datetime.strptime(creation, "%Y-%m-%d %H:%M:%S.%f")
-            except ValueError:
-                try:
-                    creation = datetime.datetime.strptime(creation, "%Y-%m-%d %H:%M:%S")
-                except ValueError:
-                    continue
-        hour = creation.hour if creation else 0
-        amount = flt(row.get("amount", 0))
-        payment_type = cstr(row.get("payment_type", "")).lower()
+	hourly_inflow: dict[int, float] = {}
+	hourly_outflow: dict[int, float] = {}
+	total_inflow = 0.0
+	total_outflow = 0.0
 
-        if "pay" in payment_type and "receive" not in payment_type:
-            hourly_outflow[hour] = hourly_outflow.get(hour, 0) + amount
-            total_outflow += amount
-        else:
-            hourly_inflow[hour] = hourly_inflow.get(hour, 0) + amount
-            total_inflow += amount
+	for parent in parents:
+		if cstr(parent.get("status")).strip().lower() in {"cancelled", "canceled"}:
+			continue
+		creation = creation_map.get(parent["name"])
+		if isinstance(creation, str):
+			try:
+				creation = datetime.datetime.strptime(creation, "%Y-%m-%d %H:%M:%S.%f")
+			except ValueError:
+				try:
+					creation = datetime.datetime.strptime(creation, "%Y-%m-%d %H:%M:%S")
+				except ValueError:
+					continue
+		hour = creation.hour if creation else 0
+		for row in rows_by_parent.get(parent["name"], []):
+			amount = flt(row.get("amount", 0))
+			payment_type = cstr(row.get("payment_type", "")).strip().lower()
+			if payment_type == "pay":
+				hourly_outflow[hour] = hourly_outflow.get(hour, 0) + amount
+				total_outflow += amount
+			elif payment_type == "receive":
+				hourly_inflow[hour] = hourly_inflow.get(hour, 0) + amount
+				total_inflow += amount
 
-    all_hours = sorted(set(list(hourly_inflow.keys()) + list(hourly_outflow.keys())))
+	all_hours = sorted(set(list(hourly_inflow.keys()) + list(hourly_outflow.keys())))
 
-    if not all_hours:
-        return {"labels": [], "inflow": [], "outflow": [], "total_inflow": 0, "total_outflow": 0, "net": 0}
+	if not all_hours:
+		return {"labels": [], "inflow": [], "outflow": [], "total_inflow": 0, "total_outflow": 0, "net": 0}
 
-    labels = [f"{h:02d}:00" for h in all_hours]
-    inflow_values = [hourly_inflow.get(h, 0) for h in all_hours]
-    outflow_values = [hourly_outflow.get(h, 0) for h in all_hours]
+	labels = [f"{h:02d}:00" for h in all_hours]
+	inflow_values = [hourly_inflow.get(h, 0) for h in all_hours]
+	outflow_values = [hourly_outflow.get(h, 0) for h in all_hours]
 
-    return {
-        "labels": labels,
-        "inflow": inflow_values,
-        "outflow": outflow_values,
-        "total_inflow": total_inflow,
-        "total_outflow": total_outflow,
-        "net": total_inflow - total_outflow,
-    }
+	return {
+		"labels": labels,
+		"inflow": inflow_values,
+		"outflow": outflow_values,
+		"total_inflow": total_inflow,
+		"total_outflow": total_outflow,
+		"net": total_inflow - total_outflow,
+	}
