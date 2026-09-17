@@ -367,24 +367,101 @@ def test_an_unconfigured_platform_reports_not_configured_without_naming_keys(mon
 	assert "pamper_oauth_ios_client_id" not in json.dumps(resp)
 
 
-def test_web_reports_bff_required_and_hands_out_no_client_id(monkeypatch):
-	"""Browser-held OAuth tokens are not an option: web must go through a BFF,
-	and must not be given a client id it could start browser-PKCE with."""
+# The web answer must not depend on site config AT ALL. Browser-held OAuth
+# tokens are not an option for this product, so `web` is refused by
+# architecture, one layer ABOVE the runtime kill switch — which is a rollback
+# for a flow that is allowed to run, and web's never is.
+WEB_CONFIG_MATRIX = {
+	"flag absent": {},
+	"flag false": {"pamper_oauth_web_enabled": False},
+	"flag true": {"pamper_oauth_web_enabled": True},
+	"client id present": {"pamper_oauth_web_client_id": "web-client-id-placeholder"},
+	"redirect present": {"pamper_oauth_web_redirect_uri": "https://app.example/callback"},
+	"fully configured": {
+		"pamper_oauth_web_enabled": True,
+		"pamper_oauth_web_client_id": "web-client-id-placeholder",
+		"pamper_oauth_web_redirect_uri": "https://app.example/callback",
+	},
+	"legacy allowed": {
+		"pamper_oauth_web_enabled": True,
+		"pamper_oauth_web_client_id": "web-client-id-placeholder",
+		"pamper_oauth_web_redirect_uri": "https://app.example/callback",
+		"pamper_allow_legacy_api_key_login": True,
+	},
+	"legacy disallowed": {
+		"pamper_oauth_web_enabled": True,
+		"pamper_oauth_web_client_id": "web-client-id-placeholder",
+		"pamper_oauth_web_redirect_uri": "https://app.example/callback",
+		"pamper_allow_legacy_api_key_login": False,
+	},
+}
+
+
+@pytest.mark.parametrize("case", list(WEB_CONFIG_MATRIX), ids=list(WEB_CONFIG_MATRIX))
+def test_web_is_always_bff_required_whatever_the_site_config_says(monkeypatch, case):
+	"""Every row of the matrix: never `disabled`, never a client id, never a
+	redirect URI, whatever is in `frappe.conf`."""
+	_oauth_harness(monkeypatch, WEB_CONFIG_MATRIX[case])
+
+	resp = user.get_oauth_config(platform="web")
+	data = resp["data"]
+
+	assert data["status"] == "bff_required", case
+	assert data["oauth_configured"] is False, case
+	assert data["client_id"] is None, case
+	assert data["redirect_uri"] is None, case
+	# A flow that may not run is not "enabled", however the key is set.
+	assert data["oauth_enabled"] is False, case
+	# Nothing web-specific leaks into the payload, not even as a key name.
+	rendered = json.dumps(resp)
+	assert "web-client-id-placeholder" not in rendered, case
+	assert "app.example" not in rendered, case
+	assert "pamper_oauth_web" not in rendered, case
+
+
+def test_the_web_guard_outranks_the_kill_switch(monkeypatch):
+	"""The ordering itself, stated as one assertion: with the web kill switch
+	ON, web is still `bff_required` and not `ready`; with it OFF, web is still
+	`bff_required` and not `disabled`."""
+	for enabled in (True, False):
+		_oauth_harness(
+			monkeypatch,
+			{
+				"pamper_oauth_web_enabled": enabled,
+				"pamper_oauth_web_client_id": "web-client-id-placeholder",
+				"pamper_oauth_web_redirect_uri": "https://app.example/callback",
+			},
+		)
+		assert user.get_oauth_config(platform="web")["data"]["status"] == "bff_required"
+
+
+def test_the_kill_switch_still_outranks_configuration_on_native(monkeypatch):
+	"""The other half of the rule: inside android/ios the runtime kill switch
+	comes first, so a fully configured platform still reports `disabled`."""
 	_oauth_harness(
 		monkeypatch,
-		{
-			"pamper_oauth_web_enabled": True,
-			"pamper_oauth_web_client_id": "web-client-id-placeholder",
-			"pamper_oauth_web_redirect_uri": "https://app.example/callback",
-		},
+		{**ANDROID_CONFIG, "pamper_oauth_android_enabled": False},
 	)
 
-	data = user.get_oauth_config(platform="web")["data"]
+	data = user.get_oauth_config(platform="android")["data"]
 
-	assert data["status"] == "bff_required"
-	assert data["oauth_configured"] is False
+	assert data["status"] == "disabled"
+	assert data["oauth_enabled"] is False
 	assert data["client_id"] is None
 	assert data["redirect_uri"] is None
+
+
+def test_legacy_login_is_reported_unchanged_on_web(monkeypatch):
+	"""Phase 03 must not disable legacy login — and the web guard must not
+	suppress the flag the login screen needs to fall back."""
+	for allowed in (True, False):
+		_oauth_harness(
+			monkeypatch,
+			{"pamper_oauth_web_enabled": True, "pamper_allow_legacy_api_key_login": allowed},
+		)
+		data = user.get_oauth_config(platform="web")["data"]
+		assert data["legacy_login_allowed"] is allowed
+		assert data["status"] == "bff_required"
 
 
 @pytest.mark.parametrize("platform", ["", None, "desktop", "windows", "../android"])
@@ -504,18 +581,25 @@ def test_an_options_preflight_short_circuits(monkeypatch):
 
 def test_oauth_is_disabled_by_default_on_a_site_that_never_configured_it(monkeypatch):
 	"""Absent key == disabled. A site that has never heard of these settings
-	keeps behaving exactly as it does today."""
+	keeps behaving exactly as it does today.
+
+	Native platforms only: `web` is refused by architecture one layer earlier
+	and reports `bff_required`, not `disabled`."""
 	_oauth_harness(monkeypatch, {})
 
-	for platform in ("android", "ios", "web"):
+	for platform in ("android", "ios"):
 		data = user.get_oauth_config(platform=platform)["data"]
 		assert data["oauth_enabled"] is False
 		assert data["status"] == "disabled"
 
+	web = user.get_oauth_config(platform="web")["data"]
+	assert web["oauth_enabled"] is False
+	assert web["status"] == "bff_required"
+
 
 def test_a_disabled_platform_hands_out_no_client_id_even_when_configured(monkeypatch):
-	"""The kill switch is checked FIRST: a client cannot start a flow even if
-	the OAuth Client is fully configured."""
+	"""Within a native platform the kill switch is checked before configuration:
+	a client cannot start a flow even if the OAuth Client is fully configured."""
 	_oauth_harness(
 		monkeypatch,
 		{

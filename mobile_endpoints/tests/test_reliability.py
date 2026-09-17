@@ -1774,12 +1774,75 @@ class TestOAuthDiscoveryContract(ReliabilityTestCase):
 			self.assertIn("platform", resp["error"]["fields"])
 			self.assertEqual(frappe.local.response.get("http_status_code"), 422)
 
+	def _override_conf(self, **values):
+		"""Temporarily override site config IN MEMORY for one test.
+
+		`frappe.conf` is the in-process view; nothing is written to
+		site_config.json, and the original values are restored on teardown even
+		if the test fails.
+		"""
+		missing = object()
+		for key, value in values.items():
+			previous = frappe.conf.get(key, missing)
+
+			def restore(key=key, previous=previous):
+				if previous is missing:
+					frappe.conf.pop(key, None)
+				else:
+					frappe.conf[key] = previous
+
+			self.addCleanup(restore)
+			frappe.conf[key] = value
+
 	def test_web_never_hands_the_browser_a_client_id(self):
 		data = _expect_success(self._get_config("web"), "get_oauth_config(web)")
 		self.assertEqual(data["status"], "bff_required")
 		self.assertIsNone(data["client_id"])
 		self.assertIsNone(data["redirect_uri"])
 		self.assertFalse(data["oauth_configured"])
+		self.assertFalse(data["oauth_enabled"])
+
+	def test_web_is_bff_required_across_every_configuration(self):
+		"""The web answer must not depend on site config at all: the
+		architecture guard outranks the runtime kill switch, because the kill
+		switch is a rollback for a flow that is allowed to run and web's is not.
+
+		Each row overrides `frappe.conf` in memory only and is restored on
+		teardown; site_config.json is never touched.
+		"""
+		matrix = {
+			"flag false": {"pamper_oauth_web_enabled": False},
+			"flag true": {"pamper_oauth_web_enabled": True},
+			"client id present": {"pamper_oauth_web_client_id": "web-client-id-placeholder"},
+			"redirect present": {"pamper_oauth_web_redirect_uri": "https://app.example/callback"},
+			"fully configured": {
+				"pamper_oauth_web_enabled": True,
+				"pamper_oauth_web_client_id": "web-client-id-placeholder",
+				"pamper_oauth_web_redirect_uri": "https://app.example/callback",
+			},
+		}
+		for case, overrides in matrix.items():
+			with self.subTest(case=case):
+				self._override_conf(**overrides)
+				resp = self._get_config("web")
+				data = _expect_success(resp, f"get_oauth_config(web) [{case}]")
+				self.assertEqual(data["status"], "bff_required")
+				self.assertIsNone(data["client_id"])
+				self.assertIsNone(data["redirect_uri"])
+				self.assertFalse(data["oauth_configured"])
+				self.assertFalse(data["oauth_enabled"])
+				rendered = json.dumps(resp, default=str)
+				self.assertNotIn("web-client-id-placeholder", rendered)
+				self.assertNotIn("app.example", rendered)
+
+	def test_web_is_bff_required_whether_or_not_legacy_login_is_allowed(self):
+		for allowed in (True, False):
+			with self.subTest(legacy_login_allowed=allowed):
+				self._override_conf(pamper_allow_legacy_api_key_login=allowed)
+				data = _expect_success(self._get_config("web"), "get_oauth_config(web)")
+				self.assertEqual(data["status"], "bff_required")
+				self.assertEqual(data["legacy_login_allowed"], allowed)
+				self.assertIsNone(data["client_id"])
 
 	def test_no_secret_ever_appears_in_the_discovery_response(self):
 		for platform in ("android", "ios", "web"):
@@ -1820,10 +1883,14 @@ class TestOAuthDiscoveryContract(ReliabilityTestCase):
 		self.assertFalse(data["redirect_uri"].lower().startswith("http://"))
 		self.assertNotIn("*", data["redirect_uri"])
 
-	def test_the_runtime_kill_switch_is_reported_per_platform(self):
+	def test_the_runtime_kill_switch_is_reported_per_native_platform(self):
 		"""Server-side rollback: flipping pamper_oauth_<platform>_enabled off
-		disables OAuth for every client with no new build. Absent == disabled."""
-		for platform in ("android", "ios", "web"):
+		disables OAuth for every client with no new build. Absent == disabled.
+
+		Android and iOS only — `web` is refused one layer earlier, by
+		architecture, so pamper_oauth_web_enabled has no effect on it.
+		"""
+		for platform in ("android", "ios"):
 			data = _expect_success(self._get_config(platform), f"get_oauth_config({platform})")
 			self.assertIn("oauth_enabled", data)
 			self.assertEqual(
@@ -1837,11 +1904,27 @@ class TestOAuthDiscoveryContract(ReliabilityTestCase):
 				self.assertIsNone(data["redirect_uri"])
 				self.assertFalse(data["oauth_configured"])
 
+	def test_the_kill_switch_can_disable_a_configured_native_platform(self):
+		"""The other half of the ordering: inside android/ios the kill switch
+		comes before configuration, so a configured platform still reports
+		`disabled` when it is off."""
+		for platform in ("android", "ios"):
+			with self.subTest(platform=platform):
+				self._override_conf(**{f"pamper_oauth_{platform}_enabled": False})
+				data = _expect_success(self._get_config(platform), f"get_oauth_config({platform})")
+				self.assertEqual(data["status"], "disabled")
+				self.assertFalse(data["oauth_enabled"])
+				self.assertIsNone(data["client_id"])
+				self.assertIsNone(data["redirect_uri"])
+
 	def test_status_is_one_of_the_documented_values(self):
 		allowed = {"disabled", "ready", "not_configured", "misconfigured", "bff_required"}
 		for platform in ("android", "ios", "web"):
 			data = _expect_success(self._get_config(platform), f"get_oauth_config({platform})")
 			self.assertIn(data["status"], allowed)
+		# And web's is always the same one.
+		web = _expect_success(self._get_config("web"), "get_oauth_config(web)")
+		self.assertEqual(web["status"], "bff_required")
 
 	def test_legacy_login_flag_is_reported_and_still_enabled(self):
 		"""Phase 03 must not disable legacy login."""

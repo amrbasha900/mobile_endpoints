@@ -99,6 +99,9 @@ OAUTH_CODE_CHALLENGE_METHOD = "S256"
 
 # One OAuth Client per Site x Environment x Platform. Values live in site
 # config only — no real client id or redirect URI is ever committed here.
+#
+# The `web` pair is reserved for the future BFF and is deliberately NEVER read
+# by this endpoint: see the architecture guard in get_oauth_config.
 OAUTH_CONFIG_KEYS = {
 	"android": ("pamper_oauth_android_client_id", "pamper_oauth_android_redirect_uri"),
 	"ios": ("pamper_oauth_ios_client_id", "pamper_oauth_ios_redirect_uri"),
@@ -112,6 +115,9 @@ OAUTH_CONFIG_KEYS = {
 # off for every client immediately, and the client falls straight back to
 # legacy login. Absent key == disabled, so a site that has never heard of these
 # keys keeps behaving exactly as it does today.
+#
+# It applies to android and ios ONLY. Web is refused one layer earlier, by
+# architecture, so `pamper_oauth_web_enabled` has no effect on this endpoint.
 OAUTH_ENABLED_KEYS = {
 	"android": "pamper_oauth_android_enabled",
 	"ios": "pamper_oauth_ios_enabled",
@@ -164,7 +170,6 @@ def get_oauth_config(platform: str | None = None):
 		)
 
 	base_url = get_url().rstrip("/")
-	oauth_enabled = bool(frappe.conf.get(OAUTH_ENABLED_KEYS[requested], False))
 	config = {
 		"platform": requested,
 		"issuer": base_url,
@@ -176,26 +181,38 @@ def get_oauth_config(platform: str | None = None):
 		"pkce_required": True,
 		"client_id": None,
 		"redirect_uri": None,
-		"oauth_enabled": oauth_enabled,
+		"oauth_enabled": False,
 		"oauth_configured": False,
 		"legacy_login_allowed": bool(frappe.conf.get("pamper_allow_legacy_api_key_login", False)),
 		"status": "not_configured",
 	}
 
-	if not oauth_enabled:
-		# The runtime kill switch, checked FIRST: a disabled platform hands out
-		# no client id and no redirect URI at all, so a client cannot start a
-		# flow even if it wanted to. Flipping this key off is the rollback —
-		# it needs no new build and no store release.
-		config["status"] = "disabled"
-		return config
-
 	if requested == "web":
+		# ARCHITECTURE GUARD, and it outranks the kill switch.
+		#
 		# Browser-held OAuth tokens are not an option for this product: Web must
 		# go through a server-side BFF. Until that exists, `web` reports that it
-		# is required — deliberately WITHOUT handing the browser a client id it
-		# could start a browser-only PKCE flow with.
+		# is required — always, and deliberately WITHOUT handing the browser a
+		# client id or redirect URI it could start a browser-only PKCE flow
+		# with. Any web OAuth keys present in site config are NOT read here, so
+		# a stray or premature configuration cannot leak through this endpoint.
+		#
+		# The kill switch is a rollback for a flow that is allowed to run. Web's
+		# flow is not allowed to run at all, so `oauth_enabled` is reported
+		# false regardless of pamper_oauth_web_enabled: a true value there must
+		# never read as "the browser may proceed".
 		config["status"] = "bff_required"
+		return config
+
+	# Native only from here down.
+	oauth_enabled = bool(frappe.conf.get(OAUTH_ENABLED_KEYS[requested], False))
+	config["oauth_enabled"] = oauth_enabled
+	if not oauth_enabled:
+		# The runtime kill switch, checked before any native configuration: a
+		# disabled platform hands out no client id and no redirect URI, so a
+		# client cannot start a flow even if it wanted to. Flipping this key off
+		# is the rollback — it needs no new build and no store release.
+		config["status"] = "disabled"
 		return config
 
 	client_id_key, redirect_uri_key = OAUTH_CONFIG_KEYS[requested]
