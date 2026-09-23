@@ -1,15 +1,22 @@
+import re
+
 import frappe
 from erpnext import get_default_company
 from frappe import _
 from frappe.utils import cstr, get_url
 from frappe.utils.password import get_decrypted_password, set_encrypted_password
 
-from mobile_endpoints.api._envelope import CompanyError, mobile_api
+from mobile_endpoints.api._envelope import CompanyError, FieldValidationError, mobile_api
 from mobile_endpoints.api.security import require_authenticated_user, set_cors_headers
 
 
 class OAuthConfigurationError(Exception):
-	"""OAuth discovery is unavailable until the site is configured."""
+	"""Retained for the documented 503 error vocabulary.
+
+	Since Phase 03 increment 2, `get_oauth_config` no longer raises it: "this
+	platform is not configured yet" is a normal pre-login answer the client has
+	to be able to read (together with `legacy_login_allowed`), not an error.
+	"""
 
 	http_status_code = 503
 
@@ -23,13 +30,14 @@ class LegacyLoginDisabledError(Exception):
 # ---------------------------------------------------------------------------
 # Phase 01 — auth / profile / OAuth discovery (restored from
 # origin/codex/pamper-online-security). get_user_default_company and
-# get_user_profile now carry the Phase 02 envelope like every other read
-# endpoint. login_with_profile and get_oauth_config deliberately do NOT --
-# they raise LegacyLoginDisabledError (410) / OAuthConfigurationError (503),
-# which are plain Exception subclasses Frappe's own dispatcher renders via
-# their `http_status_code` attribute; @mobile_api's generic `except Exception`
-# would swallow them into an undifferentiated 500, and the existing Phase 01
-# tests assert the raw exception + its status code.
+# get_user_profile carry the Phase 02 envelope like every other read endpoint,
+# and get_oauth_config joined them in Phase 03 increment 2.
+#
+# login_with_profile deliberately does NOT: it raises LegacyLoginDisabledError
+# (410), a plain Exception subclass Frappe's own dispatcher renders via its
+# `http_status_code` attribute; @mobile_api's generic `except Exception` would
+# swallow it into an undifferentiated 500, and the Phase 01 tests assert the
+# raw exception plus its status code.
 # ---------------------------------------------------------------------------
 
 
@@ -70,28 +78,165 @@ def get_user_profile():
 	}
 
 
+# ---------------------------------------------------------------------------
+# OAuth2 + PKCE discovery (Phase 03 increment 2)
+#
+# Native Authorization Code + PKCE S256 on this Frappe version is VERIFIED
+# LIVE (increment 1 probe): a token exchange carrying neither a session cookie
+# nor a client secret succeeds, refresh rotates, and revoke takes effect.
+#
+# This endpoint is the public, pre-login contract telling a client WHERE to
+# authenticate and AS WHICH client. It never returns a client secret, and it
+# never echoes a client-supplied redirect URI — the redirect URI is whatever
+# the site was configured with. Frappe matches it by exact membership
+# (frappe/oauth.py:29-42), so a request-controlled value would be both useless
+# and an open-redirect hole.
+# ---------------------------------------------------------------------------
+
+OAUTH_PLATFORMS = ("android", "ios", "web")
+OAUTH_SUPPORTED_SCOPES = "openid all"
+OAUTH_CODE_CHALLENGE_METHOD = "S256"
+
+# One OAuth Client per Site x Environment x Platform. Values live in site
+# config only — no real client id or redirect URI is ever committed here.
+#
+# The `web` pair is reserved for the future BFF and is deliberately NEVER read
+# by this endpoint: see the architecture guard in get_oauth_config.
+OAUTH_CONFIG_KEYS = {
+	"android": ("pamper_oauth_android_client_id", "pamper_oauth_android_redirect_uri"),
+	"ios": ("pamper_oauth_ios_client_id", "pamper_oauth_ios_redirect_uri"),
+	"web": ("pamper_oauth_web_client_id", "pamper_oauth_web_redirect_uri"),
+}
+
+# RUNTIME KILL SWITCH, one per platform, default OFF.
+#
+# The client's build-time flag alone cannot be the rollback: turning OAuth off
+# would need a new build and a store release. This server-side switch turns it
+# off for every client immediately, and the client falls straight back to
+# legacy login. Absent key == disabled, so a site that has never heard of these
+# keys keeps behaving exactly as it does today.
+#
+# It applies to android and ios ONLY. Web is refused one layer earlier, by
+# architecture, so `pamper_oauth_web_enabled` has no effect on this endpoint.
+OAUTH_ENABLED_KEYS = {
+	"android": "pamper_oauth_android_enabled",
+	"ios": "pamper_oauth_ios_enabled",
+	"web": "pamper_oauth_web_enabled",
+}
+
+
+_ABSOLUTE_URI_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:\S+$")
+
+
+def _oauth_redirect_uri_is_acceptable(redirect_uri: str) -> bool:
+	"""A configured redirect URI must be exact and absolute, never cleartext,
+	never a pattern.
+
+	Accepts `https://…` and the RFC 8252 §7.1 private-use scheme form
+	(`com.example.app:/path`, one slash) that is the documented native
+	fallback. Rejects `http://`, anything containing `*`, and anything without
+	a scheme.
+	"""
+	value = cstr(redirect_uri).strip()
+	if not value or "*" in value:
+		return False
+	if value.lower().startswith("http://"):
+		return False
+	return bool(_ABSOLUTE_URI_RE.match(value))
+
+
 @frappe.whitelist(allow_guest=True, methods=["GET"])
-def get_oauth_config():
-	"""Return public OAuth2 + PKCE configuration for the Pamper client."""
+@mobile_api
+def get_oauth_config(platform: str | None = None):
+	"""
+	GET /api/method/mobile_endpoints.api.user.get_oauth_config?platform=android
+
+	Public (pre-login) OAuth2 + PKCE discovery for ONE platform: endpoints,
+	that platform's client id and REGISTERED redirect URI, supported scopes,
+	and whether OAuth / legacy login are currently available.
+
+	`platform` is an allowlist of android | ios | web; anything else is a 422
+	naming the field. Never returns a client secret.
+	"""
 	set_cors_headers("GET, OPTIONS")
 	if frappe.local.request and frappe.local.request.method == "OPTIONS":
 		return {}
 
-	client_id = frappe.conf.get("pamper_oauth_client_id")
-	if not client_id:
-		frappe.throw(
-			_("Pamper OAuth client is not configured"),
-			exc=OAuthConfigurationError,
-			title=_("Configuration Error"),
+	requested = cstr(platform).strip().lower()
+	if requested not in OAUTH_PLATFORMS:
+		raise FieldValidationError(
+			_("Unsupported platform. Expected one of: {0}").format(", ".join(OAUTH_PLATFORMS)),
+			field="platform",
 		)
+
 	base_url = get_url().rstrip("/")
-	return {
-		"client_id": client_id,
+	config = {
+		"platform": requested,
+		"issuer": base_url,
 		"authorization_endpoint": f"{base_url}/api/method/frappe.integrations.oauth2.authorize",
 		"token_endpoint": f"{base_url}/api/method/frappe.integrations.oauth2.get_token",
 		"revoke_endpoint": f"{base_url}/api/method/frappe.integrations.oauth2.revoke_token",
+		"scopes_supported": OAUTH_SUPPORTED_SCOPES,
+		"code_challenge_method": OAUTH_CODE_CHALLENGE_METHOD,
 		"pkce_required": True,
+		"client_id": None,
+		"redirect_uri": None,
+		"oauth_enabled": False,
+		"oauth_configured": False,
+		"legacy_login_allowed": bool(frappe.conf.get("pamper_allow_legacy_api_key_login", False)),
+		"status": "not_configured",
 	}
+
+	if requested == "web":
+		# ARCHITECTURE GUARD, and it outranks the kill switch.
+		#
+		# Browser-held OAuth tokens are not an option for this product: Web must
+		# go through a server-side BFF. Until that exists, `web` reports that it
+		# is required — always, and deliberately WITHOUT handing the browser a
+		# client id or redirect URI it could start a browser-only PKCE flow
+		# with. Any web OAuth keys present in site config are NOT read here, so
+		# a stray or premature configuration cannot leak through this endpoint.
+		#
+		# The kill switch is a rollback for a flow that is allowed to run. Web's
+		# flow is not allowed to run at all, so `oauth_enabled` is reported
+		# false regardless of pamper_oauth_web_enabled: a true value there must
+		# never read as "the browser may proceed".
+		config["status"] = "bff_required"
+		return config
+
+	# Native only from here down.
+	oauth_enabled = bool(frappe.conf.get(OAUTH_ENABLED_KEYS[requested], False))
+	config["oauth_enabled"] = oauth_enabled
+	if not oauth_enabled:
+		# The runtime kill switch, checked before any native configuration: a
+		# disabled platform hands out no client id and no redirect URI, so a
+		# client cannot start a flow even if it wanted to. Flipping this key off
+		# is the rollback — it needs no new build and no store release.
+		config["status"] = "disabled"
+		return config
+
+	client_id_key, redirect_uri_key = OAUTH_CONFIG_KEYS[requested]
+	client_id = cstr(frappe.conf.get(client_id_key) or "").strip()
+	redirect_uri = cstr(frappe.conf.get(redirect_uri_key) or "").strip()
+
+	if not client_id or not redirect_uri:
+		# Deliberately does not say WHICH key is missing: this endpoint is
+		# reachable by guests and must not map out the site's configuration.
+		return config
+
+	if not _oauth_redirect_uri_is_acceptable(redirect_uri):
+		frappe.log_error(
+			f"Configured {redirect_uri_key} is not an acceptable redirect URI",
+			"mobile_endpoints:get_oauth_config",
+		)
+		config["status"] = "misconfigured"
+		return config
+
+	config["client_id"] = client_id
+	config["redirect_uri"] = redirect_uri
+	config["oauth_configured"] = True
+	config["status"] = "ready"
+	return config
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
