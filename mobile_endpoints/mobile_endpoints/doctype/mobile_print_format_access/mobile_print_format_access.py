@@ -32,10 +32,30 @@ DOCUMENT_KIND_DOCTYPES = {
 
 
 class MobilePrintFormatAccess(Document):
+    def before_naming(self):
+        """The composite key must exist BEFORE naming, not during validate.
+
+        Verified against Frappe 15.86.0: `Document.insert()` calls
+        `set_new_name()` before `_validate()`, and `frappe.model.naming.
+        set_new_name()` runs `before_naming` and only then resolves the
+        `field:composite_key` autoname. Building the key in `validate()` — as
+        this first shipped — therefore left the field empty at naming time and
+        a plain Desk insert failed with "Composite Key is required".
+
+        The principal must be normalised first, because the key is derived
+        from it.
+        """
+        self._validate_principal()
+        self._validate_document_kind()
+        self._set_composite_key()
+
     def validate(self):
         self._validate_principal()
         self._validate_document_kind()
         self._validate_print_format()
+        # Recomputed, never trusted: the field is hidden and read-only in the
+        # UI, but a direct API caller can still send one, and a forged key
+        # would let a rule masquerade as a different (or duplicate) one.
         self._set_composite_key()
 
     def _validate_principal(self):
@@ -93,7 +113,8 @@ class MobilePrintFormatAccess(Document):
             )
 
     def _set_composite_key(self):
-        """A stable, unique identity for the rule.
+        """A stable, unique identity for the rule — the single source of truth
+        for this value, called from both `before_naming` and `validate`.
 
         Separators are chosen so no field value can forge another rule's key:
         `::` cannot appear in a User id, a Role name, a kind or a format name

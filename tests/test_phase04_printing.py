@@ -55,6 +55,20 @@ if "frappe" not in sys.modules:  # pragma: no cover - import plumbing
     sys.modules["frappe.model"] = model_mod
     sys.modules["frappe.model.document"] = document_mod
 
+# Whoever installed the base `frappe` stub first wins — the Phase 02 suite
+# installs one without `frappe.model`, and pytest may collect it before this
+# file. The controller imports `frappe.model.document`, so the submodule is
+# topped up unconditionally rather than only when this file creates the stub.
+if "frappe.model.document" not in sys.modules:  # pragma: no cover - plumbing
+    _frappe = sys.modules["frappe"]
+    _document_mod = types.ModuleType("frappe.model.document")
+    _document_mod.Document = type("Document", (), {})
+    _model_mod = types.ModuleType("frappe.model")
+    _model_mod.document = _document_mod
+    _frappe.model = _model_mod
+    sys.modules["frappe.model"] = _model_mod
+    sys.modules["frappe.model.document"] = _document_mod
+
 from mobile_endpoints.api import printing  # noqa: E402
 from mobile_endpoints.api._envelope import FieldValidationError  # noqa: E402
 
@@ -765,3 +779,123 @@ def test_the_module_never_bypasses_permissions():
     # `read`, which ordinary users do not have.
     assert "get_list" not in code
     assert "save_file" not in code
+
+
+# --- naming lifecycle --------------------------------------------------------
+#
+# These check the SHAPE of the fix, not the sequence. A standalone test cannot
+# prove Frappe's real ordering — it does not run `Document.insert()` — so the
+# proof that `before_naming` fires before the `field:` autoname resolves lives
+# in the bench suite (`TestPrintPolicyNamingLifecycle`). What is worth pinning
+# here is that the hook exists, that it produces the key, and that one helper
+# remains the single source of truth.
+
+
+def _policy_controller():
+    from mobile_endpoints.mobile_endpoints.doctype.mobile_print_format_access import (
+        mobile_print_format_access as module,
+    )
+
+    return module
+
+
+def _rule_doc(**overrides):
+    """A controller instance with fields set, without Frappe's Document base."""
+    module = _policy_controller()
+    doc = module.MobilePrintFormatAccess.__new__(module.MobilePrintFormatAccess)
+    doc.principal_type = overrides.get("principal_type", "User")
+    doc.user = overrides.get("user", USER_A)
+    doc.role = overrides.get("role")
+    doc.document_kind = overrides.get("document_kind", "invoice")
+    doc.print_format = overrides.get("print_format", "Invoice A")
+    doc.composite_key = overrides.get("composite_key")
+    return doc
+
+
+def test_the_controller_exposes_a_before_naming_hook():
+    module = _policy_controller()
+    # The autoname is `field:composite_key`, which Frappe resolves before
+    # validate() — so the value has to be built in a pre-naming hook.
+    assert hasattr(module.MobilePrintFormatAccess, "before_naming")
+
+
+def test_before_naming_populates_the_key_without_any_client_value():
+    doc = _rule_doc(composite_key=None)
+    doc.before_naming()
+    assert doc.composite_key == "User::a@example.com::invoice::Invoice A"
+
+
+def test_validate_recomputes_a_forged_key(monkeypatch):
+    module = _policy_controller()
+    monkeypatch.setattr(
+        module,
+        "frappe",
+        SimpleNamespace(
+            _=lambda m: m,
+            throw=lambda msg: (_ for _ in ()).throw(AssertionError(msg)),
+            db=SimpleNamespace(
+                get_value=lambda *a, **k: SimpleNamespace(
+                    name="Invoice A", doc_type=INVOICE_DT, disabled=0, raw_printing=0
+                )
+            ),
+        ),
+    )
+    doc = _rule_doc(composite_key="User::someone-else@example.com::invoice::Anything")
+    doc.validate()
+    # The submitted value is discarded rather than trusted.
+    assert doc.composite_key == "User::a@example.com::invoice::Invoice A"
+
+
+def test_the_key_is_built_in_exactly_one_place():
+    """No duplicated hashing logic between the two hooks."""
+    import inspect
+
+    module = _policy_controller()
+    source = inspect.getsource(module.MobilePrintFormatAccess)
+    # One definition, called from both hooks.
+    assert source.count("def _set_composite_key") == 1
+    assert source.count("self._set_composite_key()") == 2
+    # The join lives only inside the helper.
+    assert source.count('"::".join') == 1
+
+
+def test_a_role_rule_keys_on_the_role_and_clears_the_user():
+    doc = _rule_doc(principal_type="Role", role="Accounts User", user=USER_A)
+    doc.before_naming()
+    assert doc.composite_key == "Role::Accounts User::invoice::Invoice A"
+    assert doc.user is None
+
+
+class _Refused(Exception):
+    """Stands in for `frappe.throw`, which raises rather than returns."""
+
+
+def _refusing_frappe(monkeypatch):
+    module = _policy_controller()
+    monkeypatch.setattr(
+        module,
+        "frappe",
+        SimpleNamespace(
+            _=lambda m: m,
+            throw=lambda msg: (_ for _ in ()).throw(_Refused(msg)),
+        ),
+    )
+    return module
+
+
+def test_before_naming_refuses_a_missing_principal(monkeypatch):
+    _refusing_frappe(monkeypatch)
+    with pytest.raises(_Refused, match="user"):
+        _rule_doc(user=None).before_naming()
+
+
+def test_before_naming_refuses_an_unknown_document_kind(monkeypatch):
+    _refusing_frappe(monkeypatch)
+    with pytest.raises(_Refused, match="Document kind"):
+        _rule_doc(document_kind="sales_invoice").before_naming()
+
+
+def test_before_naming_refuses_an_unknown_principal_type(monkeypatch):
+    _refusing_frappe(monkeypatch)
+    with pytest.raises(_Refused, match="Principal type"):
+        _rule_doc(principal_type="Group").before_naming()

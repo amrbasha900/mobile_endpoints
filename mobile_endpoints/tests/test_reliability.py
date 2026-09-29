@@ -2147,3 +2147,115 @@ class TestPrintPolicyContract(ReliabilityTestCase):
 	def test_the_header_hook_is_registered(self):
 		hooks = frappe.get_hooks("after_request")
 		self.assertIn("mobile_endpoints.api.printing.apply_print_response_headers", hooks)
+
+class TestPrintPolicyNamingLifecycle(ReliabilityTestCase):
+	"""The naming lifecycle of Mobile Print Format Access, on a real site.
+
+	This exists because a standalone test cannot prove it. The bug it guards
+	against — building `composite_key` in `validate()` while `autoname` is
+	`field:composite_key` — only shows up when Frappe's real `insert()` runs
+	`set_new_name()` before `_validate()`. Mocks that call `validate()`
+	directly would have passed happily.
+
+	NOT RUN in this change: no bench is available here.
+	"""
+
+	def _usable_format(self, kind):
+		"""A real, enabled, non-raw print format bound to the right DocType."""
+		doctype = printing.PRINTABLE_DOCUMENTS[kind]
+		return frappe.db.get_value(
+			"Print Format",
+			{"doc_type": doctype, "disabled": 0, "raw_printing": 0},
+			"name",
+		)
+
+	def _make(self, **overrides):
+		kind = overrides.pop("document_kind", "invoice")
+		fmt = overrides.pop("print_format", None) or self._usable_format(kind)
+		if not fmt:
+			self.skipTest(f"no usable print format for {kind} on this site")
+		values = {
+			"doctype": printing.POLICY_DOCTYPE,
+			"principal_type": "User",
+			"user": "Administrator",
+			"document_kind": kind,
+			"print_format": fmt,
+			# Deliberately NO composite_key: a Desk user never supplies it.
+		}
+		values.update(overrides)
+		return frappe.get_doc(values)
+
+	def test_insert_succeeds_without_a_client_supplied_composite_key(self):
+		doc = self._make()
+		doc.insert()
+		self.addCleanup(lambda: frappe.delete_doc(printing.POLICY_DOCTYPE, doc.name, force=1))
+
+		self.assertTrue(doc.composite_key, "composite_key was not populated during naming")
+		# The naming contract: the document is named by the key.
+		self.assertEqual(doc.name, doc.composite_key)
+		self.assertIn("User::Administrator::invoice::", doc.composite_key)
+
+	def test_a_duplicate_logical_rule_is_rejected(self):
+		first = self._make()
+		first.insert()
+		self.addCleanup(lambda: frappe.delete_doc(printing.POLICY_DOCTYPE, first.name, force=1))
+
+		with self.assertRaises(frappe.exceptions.DuplicateEntryError):
+			self._make(print_format=first.print_format).insert()
+
+	def test_a_forged_composite_key_is_recomputed_not_honoured(self):
+		doc = self._make(composite_key="User::someone-else@example.com::invoice::Anything")
+		doc.insert()
+		self.addCleanup(lambda: frappe.delete_doc(printing.POLICY_DOCTYPE, doc.name, force=1))
+
+		# The value the client sent is discarded; the key reflects the real row.
+		self.assertNotIn("someone-else@example.com", doc.composite_key)
+		self.assertIn("Administrator", doc.composite_key)
+		self.assertEqual(doc.name, doc.composite_key)
+
+	def test_a_role_rule_is_named_by_its_role(self):
+		fmt = self._usable_format("invoice")
+		if not fmt:
+			self.skipTest("no usable invoice print format on this site")
+		doc = frappe.get_doc(
+			{
+				"doctype": printing.POLICY_DOCTYPE,
+				"principal_type": "Role",
+				"role": "System Manager",
+				"document_kind": "invoice",
+				"print_format": fmt,
+			}
+		)
+		doc.insert()
+		self.addCleanup(lambda: frappe.delete_doc(printing.POLICY_DOCTYPE, doc.name, force=1))
+
+		self.assertIn("Role::System Manager::invoice::", doc.composite_key)
+		# The unused principal field is cleared rather than left dangling.
+		self.assertFalse(doc.user)
+
+	def test_a_missing_principal_is_still_rejected(self):
+		with self.assertRaises(frappe.exceptions.ValidationError):
+			self._make(principal_type="User", user=None).insert()
+
+	def test_an_invalid_document_kind_is_still_rejected(self):
+		with self.assertRaises(frappe.exceptions.ValidationError):
+			self._make(document_kind="sales_invoice").insert()
+
+	def test_a_format_bound_to_another_doctype_is_still_rejected(self):
+		"""The invoice kind must not accept a payment format, and vice versa."""
+		payment_format = self._usable_format("payment")
+		if not payment_format:
+			self.skipTest("no usable payment print format on this site")
+		with self.assertRaises(frappe.exceptions.ValidationError):
+			self._make(document_kind="invoice", print_format=payment_format).insert()
+
+	def test_a_disabled_format_is_still_rejected(self):
+		disabled = frappe.db.get_value(
+			"Print Format",
+			{"doc_type": printing.PRINTABLE_DOCUMENTS["invoice"], "disabled": 1},
+			"name",
+		)
+		if not disabled:
+			self.skipTest("no disabled invoice print format on this site")
+		with self.assertRaises(frappe.exceptions.ValidationError):
+			self._make(print_format=disabled).insert()
