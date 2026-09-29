@@ -250,3 +250,13 @@ scheduler_events = {
 		"mobile_endpoints.api._idempotency.cleanup_old_logs",
 	],
 }
+
+
+# --- Mobile Endpoints: PDF response hardening -------------------------------
+# Scoped to the print endpoint by a flag on frappe.local; every other response
+# passes through untouched. `after_request` receives the real werkzeug response
+# (frappe/app.py), which is the only place these headers can actually be set
+# for a `download`-type response.
+after_request = [
+	"mobile_endpoints.api.printing.apply_print_response_headers",
+]

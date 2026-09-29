@@ -85,6 +85,7 @@ from mobile_endpoints.api import invoice as invoice_api
 from mobile_endpoints.api import operation as operation_api
 from mobile_endpoints.api import payment as payment_api
 from mobile_endpoints.api import security as security_api
+from mobile_endpoints.api import printing
 from mobile_endpoints.api import user as user_api
 from mobile_endpoints.api._idempotency import DOCTYPE as LOG_DOCTYPE
 from mobile_endpoints.api._idempotency import _composite
@@ -2064,3 +2065,85 @@ class TestCorsHeaders(FrappeTestCase):
 		frappe.local.request = frappe._dict(method="GET", headers={"Origin": "https://attacker.example"})
 		security_api.set_cors_headers("GET, OPTIONS")
 		self.assertNotIn("headers", frappe.local.response)
+
+class TestPrintPolicyContract(ReliabilityTestCase):
+	"""Phase 04 printing, against a real site.
+
+	NOT RUN in this change — there is no bench available here. These are
+	written so the first bench run exercises the parts the standalone suite
+	must stub: real permissions, a real `Print Format` table, and real PDF
+	generation.
+	"""
+
+	def _settings(self):
+		_set_get_request()
+		return printing.get_print_settings()
+
+	def test_settings_answer_for_both_documents_only(self):
+		data = _expect_success(self._settings(), "get_print_settings")
+		self.assertEqual(set(data["documents"]), {"invoice", "payment"})
+		self.assertEqual(data["documents"]["invoice"]["doctype"], "Invoice Form")
+		self.assertEqual(data["documents"]["payment"]["doctype"], "Collection and Payment")
+
+	def test_no_policy_means_no_formats(self):
+		"""Deny by default on a real site: a user with no rule sees nothing,
+		however many print formats the site has."""
+		data = _expect_success(self._settings(), "get_print_settings")
+		for kind in ("invoice", "payment"):
+			entry = data["documents"][kind]
+			if not frappe.db.exists(
+				printing.POLICY_DOCTYPE, {"document_kind": kind, "enabled": 1}
+			):
+				self.assertEqual(entry["formats"], [], f"{kind} leaked formats with no policy")
+				self.assertIsNone(entry["effective"])
+				self.assertTrue(entry["needs_selection"])
+
+	def test_settings_never_carry_template_source(self):
+		rendered = json.dumps(self._settings(), default=str).lower()
+		for leak in ("<div", "jinja", "{{", "raw_commands"):
+			self.assertNotIn(leak, rendered)
+
+	def test_an_unknown_document_kind_is_422(self):
+		_set_post_body({"invoice_format": "Nope"})
+		resp = printing.update_print_settings(invoice_format="Nope", client_request_id="bench-1")
+		self.assertFalse(resp["success"])
+		self.assertEqual(resp["error"]["code"], "validation_error")
+
+	def test_the_policy_doctype_is_not_readable_by_an_ordinary_user(self):
+		"""The rules themselves are administrative data. A user learns which
+		formats they may use, never who else may use what."""
+		self.assertTrue(frappe.db.exists("DocType", printing.POLICY_DOCTYPE))
+		meta = frappe.get_meta(printing.POLICY_DOCTYPE)
+		roles = {perm.role for perm in meta.permissions if perm.read}
+		self.assertEqual(roles, {"System Manager"})
+
+	def test_render_refuses_a_document_the_user_cannot_read(self):
+		_set_post_body({"document_kind": "invoice", "name": "does-not-exist"})
+		result = printing.render_document_pdf(document_kind="invoice", name="does-not-exist")
+		self.assertFalse(result["success"])
+		self.assertIn(result["error"]["code"], {"not_permitted", "no_print_format"})
+
+	def test_render_produces_a_real_pdf_when_a_policy_exists(self):
+		"""The only test here that exercises wkhtmltopdf. Skipped unless the
+		site actually has a rule and a printable invoice, because creating
+		either would be a fixture this suite should not own."""
+		data = _expect_success(self._settings(), "get_print_settings")
+		effective = data["documents"]["invoice"]["effective"]
+		if not effective:
+			self.skipTest("no effective invoice print format for this user on this site")
+		name = frappe.db.get_value("Invoice Form", {}, "name")
+		if not name:
+			self.skipTest("no Invoice Form on this site")
+
+		_set_post_body({"document_kind": "invoice", "name": name})
+		printing.render_document_pdf(document_kind="invoice", name=name)
+		response = frappe.local.response
+		self.assertEqual(response.get("type"), "download")
+		self.assertEqual(response.get("content_type"), "application/pdf")
+		self.assertTrue(response.get("filecontent", b"").startswith(b"%PDF"))
+		# Nothing persisted: no File row was created for this render.
+		self.assertNotIn("file_url", response)
+
+	def test_the_header_hook_is_registered(self):
+		hooks = frappe.get_hooks("after_request")
+		self.assertIn("mobile_endpoints.api.printing.apply_print_response_headers", hooks)
