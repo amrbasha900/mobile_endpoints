@@ -2066,13 +2066,55 @@ class TestCorsHeaders(FrappeTestCase):
 		security_api.set_cors_headers("GET, OPTIONS")
 		self.assertNotIn("headers", frappe.local.response)
 
-class TestPrintPolicyContract(ReliabilityTestCase):
+class _PrintPolicyIsolationMixin:
+	"""Proves a print-policy test left the site's own rules untouched.
+
+	The printing suite inserts rules whose names are derived from real site
+	data, so "we only deleted what we created" has to be demonstrated rather
+	than asserted in a comment. Every test in both printing classes snapshots
+	the policy table before it runs and compares it after cleanup.
+
+	It catches two different mistakes: a cleanup that deletes by filter instead
+	of by name, and a test that edits an administrator's existing rule to make
+	itself pass.
+	"""
+
+	def setUp(self):
+		super().setUp()
+		self._policies_before = self._policy_snapshot()
+
+	def tearDown(self):
+		# Base tearDown runs _cleanup_tracked_docs() first, so this compares the
+		# site as the next test will find it.
+		super().tearDown()
+		after = self._policy_snapshot()
+		self.assertEqual(
+			after,
+			self._policies_before,
+			"a pre-existing print policy was deleted or modified by this test",
+		)
+
+	@staticmethod
+	def _policy_snapshot() -> dict:
+		"""name -> modified, for every rule on the site."""
+		return {
+			row.name: str(row.modified)
+			for row in frappe.get_all(
+				printing.POLICY_DOCTYPE, fields=["name", "modified"], limit_page_length=0
+			)
+		}
+
+
+class TestPrintPolicyContract(_PrintPolicyIsolationMixin, ReliabilityTestCase):
 	"""Phase 04 printing, against a real site.
 
-	NOT RUN in this change — there is no bench available here. These are
-	written so the first bench run exercises the parts the standalone suite
-	must stub: real permissions, a real `Print Format` table, and real PDF
-	generation.
+	These exercise what the standalone suite has to stub: real permissions, a
+	real `Print Format` table, and real PDF generation.
+
+	Bench-only, and bench-run: the first run on a live site found four defects
+	in these tests rather than in production code -- three collided with a
+	policy an administrator had created by hand, and one ran as Administrator
+	while claiming to test a refusal. Both causes were test isolation.
 	"""
 
 	def _settings(self):
@@ -2118,10 +2160,46 @@ class TestPrintPolicyContract(ReliabilityTestCase):
 		self.assertEqual(roles, {"System Manager"})
 
 	def test_render_refuses_a_document_the_user_cannot_read(self):
-		_set_post_body({"document_kind": "invoice", "name": "does-not-exist"})
-		result = printing.render_document_pdf(document_kind="invoice", name="does-not-exist")
+		"""A user without read access on the document is refused.
+
+		This used to run as Administrator against the name "does-not-exist".
+		Administrator can read anything, so the permission branch was never
+		taken: execution fell through to the generator, which failed on the
+		missing document and answered `render_failed`. The test was asserting
+		the wrong thing about the wrong identity -- the production check was
+		correct all along.
+
+		Ordering note, from `render_document_pdf`: `has_permission` on the
+		document is checked *before* the print format is resolved, so no policy
+		fixture is needed to reach the refusal. Adding one would not make this
+		stronger.
+
+		The document is one this test created, so no customer record is read.
+		"""
+		name = self.create_invoice_ok(f"print-perm-{uuid.uuid4().hex[:8]}")["name"]
+
+		restricted = _test_user()
+		original = frappe.session.user
+		try:
+			frappe.set_user(restricted)
+			# If this user could read the invoice the assertion below would pass
+			# for the wrong reason, so the premise is checked rather than assumed.
+			self.assertFalse(
+				frappe.has_permission("Invoice Form", "read", doc=name),
+				f"{restricted} can read the invoice, so this cannot test a refusal",
+			)
+			_set_post_body({"document_kind": "invoice", "name": name})
+			result = printing.render_document_pdf(document_kind="invoice", name=name)
+		finally:
+			# Restored here, not left to tearDown: an assertion failure above
+			# must not leave the session as a user with no permissions, or every
+			# later test in the run inherits it.
+			frappe.set_user(original)
+
 		self.assertFalse(result["success"])
-		self.assertIn(result["error"]["code"], {"not_permitted", "no_print_format"})
+		self.assertEqual(result["error"]["code"], "not_permitted")
+		# The refusal says nothing about whether the document exists.
+		self.assertNotIn(name, json.dumps(result, default=str))
 
 	def test_render_produces_a_real_pdf_when_a_policy_exists(self):
 		"""The only test here that exercises wkhtmltopdf. Skipped unless the
@@ -2148,7 +2226,8 @@ class TestPrintPolicyContract(ReliabilityTestCase):
 		hooks = frappe.get_hooks("after_request")
 		self.assertIn("mobile_endpoints.api.printing.apply_print_response_headers", hooks)
 
-class TestPrintPolicyNamingLifecycle(ReliabilityTestCase):
+
+class TestPrintPolicyNamingLifecycle(_PrintPolicyIsolationMixin, ReliabilityTestCase):
 	"""The naming lifecycle of Mobile Print Format Access, on a real site.
 
 	This exists because a standalone test cannot prove it. The bug it guards
@@ -2157,11 +2236,62 @@ class TestPrintPolicyNamingLifecycle(ReliabilityTestCase):
 	`set_new_name()` before `_validate()`. Mocks that call `validate()`
 	directly would have passed happily.
 
-	NOT RUN in this change: no bench is available here.
+	Every rule here is keyed to a principal created by the test that needs it,
+	so no name this suite produces can already exist on the site. That is not
+	defensive: the first bench run failed three of these because they all built
+	`User::Administrator::invoice::<first format>` and an administrator had
+	created exactly that rule.
 	"""
 
+	def _unique_principal(self) -> str:
+		"""A User this test owns, unique to this test.
+
+		The reason this exists: the helper used to hardcode `Administrator`
+		plus "the first usable print format", so the composite key it produced
+		was `User::Administrator::invoice::<first format>`. On a site where an
+		administrator had created exactly that rule by hand, three tests
+		collided with real data and failed. A principal nobody else can be
+		using makes the key unique by construction, without touching the
+		existing rule.
+
+		Registered with track() the moment the insert succeeds, so cleanup
+		deletes this exact name and nothing else. track() pops in reverse, so
+		a rule created afterwards is removed before its principal.
+		"""
+		email = f"{TEST_PREFIX.lower()}-principal-{uuid.uuid4().hex[:12]}@example.invalid"
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": email,
+				"first_name": "MEP Print Policy Principal",
+				"send_welcome_email": 0,
+				"enabled": 1,
+				"user_type": "System User",
+			}
+		).insert(ignore_permissions=True)
+		self.track("User", email)
+		frappe.db.commit()
+		return email
+
+	def _unique_role(self) -> str:
+		"""A Role this test owns, for the Role-principal case."""
+		role = f"{TEST_PREFIX}-ROLE-{uuid.uuid4().hex[:8]}"
+		frappe.get_doc({"doctype": "Role", "role_name": role, "desk_access": 0}).insert(
+			ignore_permissions=True
+		)
+		self.track("Role", role)
+		frappe.db.commit()
+		return role
+
 	def _usable_format(self, kind):
-		"""A real, enabled, non-raw print format bound to the right DocType."""
+		"""A real, enabled, non-raw print format bound to the right DocType.
+
+		Only ever called with a kind this app declares printable -- callers
+		testing an invalid kind pass `print_format` explicitly, because
+		indexing PRINTABLE_DOCUMENTS with the bad value raised KeyError inside
+		this helper and the test never reached the validation it was written
+		for.
+		"""
 		doctype = printing.PRINTABLE_DOCUMENTS[kind]
 		return frappe.db.get_value(
 			"Print Format",
@@ -2171,65 +2301,89 @@ class TestPrintPolicyNamingLifecycle(ReliabilityTestCase):
 
 	def _make(self, **overrides):
 		kind = overrides.pop("document_kind", "invoice")
-		fmt = overrides.pop("print_format", None) or self._usable_format(kind)
-		if not fmt:
-			self.skipTest(f"no usable print format for {kind} on this site")
+		fmt = overrides.pop("print_format", None)
+		if fmt is None:
+			# Deliberately after the `print_format` override is consumed: the
+			# invalid-kind test supplies its own format so this lookup, which
+			# would raise KeyError on an unknown kind, is never reached.
+			fmt = self._usable_format(kind)
+			if not fmt:
+				self.skipTest(f"no usable print format for {kind} on this site")
 		values = {
 			"doctype": printing.POLICY_DOCTYPE,
 			"principal_type": "User",
-			"user": "Administrator",
 			"document_kind": kind,
 			"print_format": fmt,
 			# Deliberately NO composite_key: a Desk user never supplies it.
 		}
+		# A principal is minted only when the caller did not name one, so the
+		# tests that deliberately omit it still exercise that rejection.
+		if "user" not in overrides and "role" not in overrides:
+			values["user"] = self._unique_principal()
 		values.update(overrides)
 		return frappe.get_doc(values)
 
 	def test_insert_succeeds_without_a_client_supplied_composite_key(self):
-		doc = self._make()
+		principal = self._unique_principal()
+		doc = self._make(user=principal)
 		doc.insert()
-		self.addCleanup(lambda: frappe.delete_doc(printing.POLICY_DOCTYPE, doc.name, force=1))
+		self.track(printing.POLICY_DOCTYPE, doc.name)
 
 		self.assertTrue(doc.composite_key, "composite_key was not populated during naming")
 		# The naming contract: the document is named by the key.
 		self.assertEqual(doc.name, doc.composite_key)
-		self.assertIn("User::Administrator::invoice::", doc.composite_key)
+		self.assertIn(f"User::{principal}::invoice::", doc.composite_key)
 
 	def test_a_duplicate_logical_rule_is_rejected(self):
-		first = self._make()
+		# One principal, used twice on purpose: the second insert must collide
+		# on the composite key. Unique to this test, so the collision is with
+		# the row this test just made and never with a real policy.
+		principal = self._unique_principal()
+		first = self._make(user=principal)
 		first.insert()
-		self.addCleanup(lambda: frappe.delete_doc(printing.POLICY_DOCTYPE, first.name, force=1))
+		self.track(printing.POLICY_DOCTYPE, first.name)
 
 		with self.assertRaises(frappe.exceptions.DuplicateEntryError):
-			self._make(print_format=first.print_format).insert()
+			self._make(user=principal, print_format=first.print_format).insert()
+
+		# Only the first rule was created, so only the first is cleaned up.
+		self.assertTrue(frappe.db.exists(printing.POLICY_DOCTYPE, first.name))
 
 	def test_a_forged_composite_key_is_recomputed_not_honoured(self):
-		doc = self._make(composite_key="User::someone-else@example.com::invoice::Anything")
+		principal = self._unique_principal()
+		doc = self._make(
+			user=principal,
+			composite_key="User::someone-else@example.com::invoice::Anything",
+		)
 		doc.insert()
-		self.addCleanup(lambda: frappe.delete_doc(printing.POLICY_DOCTYPE, doc.name, force=1))
+		self.track(printing.POLICY_DOCTYPE, doc.name)
 
 		# The value the client sent is discarded; the key reflects the real row.
 		self.assertNotIn("someone-else@example.com", doc.composite_key)
-		self.assertIn("Administrator", doc.composite_key)
+		self.assertIn(principal, doc.composite_key)
 		self.assertEqual(doc.name, doc.composite_key)
 
 	def test_a_role_rule_is_named_by_its_role(self):
 		fmt = self._usable_format("invoice")
 		if not fmt:
 			self.skipTest("no usable invoice print format on this site")
+		# A role of this test's own. `System Manager` would have produced a key
+		# an administrator could plausibly have created by hand, which is the
+		# collision this suite already hit once with `Administrator`.
+		role = self._unique_role()
 		doc = frappe.get_doc(
 			{
 				"doctype": printing.POLICY_DOCTYPE,
 				"principal_type": "Role",
-				"role": "System Manager",
+				"role": role,
 				"document_kind": "invoice",
 				"print_format": fmt,
 			}
 		)
 		doc.insert()
-		self.addCleanup(lambda: frappe.delete_doc(printing.POLICY_DOCTYPE, doc.name, force=1))
+		self.track(printing.POLICY_DOCTYPE, doc.name)
 
-		self.assertIn("Role::System Manager::invoice::", doc.composite_key)
+		self.assertIn(f"Role::{role}::invoice::", doc.composite_key)
 		# The unused principal field is cleared rather than left dangling.
 		self.assertFalse(doc.user)
 
@@ -2238,8 +2392,20 @@ class TestPrintPolicyNamingLifecycle(ReliabilityTestCase):
 			self._make(principal_type="User", user=None).insert()
 
 	def test_an_invalid_document_kind_is_still_rejected(self):
+		"""The controller rejects the kind -- not the test helper.
+
+		Previously this passed the bad kind to a helper that did
+		`PRINTABLE_DOCUMENTS[kind]` to find a format, so it died with KeyError
+		inside the helper and never called the validation it claims to test. A
+		valid format is supplied here so the only thing left to object to is
+		the kind.
+		"""
+		fmt = self._usable_format("invoice")
+		if not fmt:
+			self.skipTest("no usable invoice print format on this site")
+
 		with self.assertRaises(frappe.exceptions.ValidationError):
-			self._make(document_kind="sales_invoice").insert()
+			self._make(document_kind="sales_invoice", print_format=fmt).insert()
 
 	def test_a_format_bound_to_another_doctype_is_still_rejected(self):
 		"""The invoice kind must not accept a payment format, and vice versa."""
